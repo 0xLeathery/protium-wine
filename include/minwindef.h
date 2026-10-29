@@ -58,7 +58,13 @@ extern "C" {
 #undef __thiscall
 
 #ifdef WINE_UNIX_LIB
+#if defined(__aarch64__) && defined(__APPLE__)
+/* PE code calls the Unix side's syscalls with the Windows ABI, which passes stack arguments in
+ * 8-byte slots; Apple's arm64 ABI packs them, ms_abi keeps the slots. */
+# define __stdcall __attribute__((ms_abi))
+#else
 # define __stdcall
+#endif
 # define __cdecl
 #else
 # if defined(__i386__) && defined(__GNUC__)
