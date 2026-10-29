@@ -50,6 +50,11 @@
 #ifdef HAVE_SYS_UCONTEXT_H
 # include <sys/ucontext.h>
 #endif
+#ifdef __APPLE__
+# include <dlfcn.h>
+# include <stdbool.h>
+# include <sys/time.h>
+#endif
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -1542,6 +1547,57 @@ void syscall_dispatcher_return_slowpath(void)
     raise( SIGUSR2 );
 }
 
+#ifdef __APPLE__
+static void (*pos_set_custom_x18_abi_enabled)(bool);
+
+static void init_custom_x18_abi(void)
+{
+    pos_set_custom_x18_abi_enabled = dlsym( RTLD_DEFAULT, "os_set_custom_x18_abi_enabled" );
+}
+
+/***********************************************************************
+ *           enable_custom_x18_abi
+ *
+ * The macOS kernel zeroes x18 on context switches and system calls unless the thread opts into
+ * the custom x18 ABI (macOS 26.4 and later), which needs the
+ * com.apple.security.custom-x18-abi-toggle entitlement on the loader. x18 holds the TEB, so
+ * every thread opts in before it first runs Windows code. Without the entitlement,
+ * os_custom_x18_abi_enabled() still reports the mode as enabled, and x18 survives some system
+ * calls but not a context switch. So check that x18 survives a short blocking system call, and
+ * stop before any Windows code runs if it doesn't.
+ */
+static void enable_custom_x18_abi(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    const ULONG64 magic = 0x5a5a123456789abcull;
+    struct timeval timeout = { 0, 20 };
+    register struct timeval *ptimeout __asm__( "x4" ) = &timeout;
+    ULONG64 x18;
+
+    pthread_once( &once, init_custom_x18_abi );
+    if (pos_set_custom_x18_abi_enabled) pos_set_custom_x18_abi_enabled( true );
+
+    /* select( 0, NULL, NULL, NULL, &timeout ) with x18 live; x18 is reserved on macOS, so the
+     * compiler never uses it and it isn't listed as clobbered */
+    __asm__ volatile( "mov x18, %2\n\t"
+                      "mov x0, #0\n\t"
+                      "mov x1, #0\n\t"
+                      "mov x2, #0\n\t"
+                      "mov x3, #0\n\t"
+                      "mov x16, #407\n\t"  /* SYS_select_nocancel */
+                      "svc #0x80\n\t"
+                      "mov %0, x18"
+                      : "=r" (x18), "+r" (ptimeout) : "r" (magic)
+                      : "x0", "x1", "x2", "x3", "x16", "memory", "cc" );
+    if (x18 == magic) return;
+
+    MESSAGE( "wine: x18 is not preserved on this thread, so Windows code can't find its TEB.\n"
+             "wine: The Wine loader needs the com.apple.security.custom-x18-abi-toggle entitlement%s.\n",
+             pos_set_custom_x18_abi_enabled ? "" : ", and macOS 26.4 or later for os_set_custom_x18_abi_enabled()" );
+    abort_process( 1 );
+}
+#endif
+
 /***********************************************************************
  *           init_syscall_frame
  */
@@ -1553,6 +1609,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     ARM_CONTEXT *arm_context;
 
 #ifdef __APPLE__
+    enable_custom_x18_abi();  /* before any PE code runs on this thread */
     set_teb_tsd_slot( teb );  /* before any PE code runs on this thread */
 #endif
     context.X0  = (DWORD64)entry;
