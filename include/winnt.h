@@ -2519,17 +2519,6 @@ static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
 {
     return (struct _TEB *)__readfsdword( 0x18 );
 }
-#elif defined(__aarch64__) && !defined(__arm64ec__) && defined(__GNUC__) && defined(WINE_TEB_TSD_SLOT)
-/* The host doesn't preserve x18 (macOS), so the TEB is kept in a thread-specific data slot of the
- * host's thread pointer TPIDRRO_EL0, whose low 3 bits may hold the CPU number. */
-static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
-{
-    struct _TEB *teb;
-    __asm__("mrs %0, tpidrro_el0\n\t"
-            "and %0, %0, #0xfffffffffffffff8\n\t"
-            "ldr %0, [%0, #%c1]" : "=r" (teb) : "n" (WINE_TEB_TSD_SLOT * 8));
-    return teb;
-}
 #elif (defined(__aarch64__) || defined(__arm64ec__)) && defined(__GNUC__)
 register struct _TEB *__wine_current_teb __asm__("x18");
 static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
