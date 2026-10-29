@@ -311,7 +311,7 @@ static const UINT_PTR host_page_mask = 0xfff;
 #if defined(__i386__) || defined(__x86_64__)
 static void *address_space_start = (void *)0x110000; /* keep DOS area clear */
 #elif defined(__APPLE__) && defined(__aarch64__)
-static void *address_space_start = (void *)0x100000000; /* nothing can be mapped below 4 GB */
+static void *address_space_start = (void *)0x100000000; /* nothing below 4 GB; raised in virtual_init() */
 #else
 static void *address_space_start = (void *)0x10000;
 #endif
@@ -833,6 +833,28 @@ static void reserve_area( void *addr, void *end )
 #endif /* __APPLE__ */
 }
 
+
+#if defined(__APPLE__) && defined(__aarch64__)
+/***********************************************************************
+ *           get_host_address_floor
+ *
+ * Nothing can be mapped below the slid main executable, which is the lowest host mapping.
+ */
+static void *get_host_address_floor(void)
+{
+    mach_vm_address_t address = 0;
+    mach_vm_size_t size;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t dummy_object_name = MACH_PORT_NULL;
+
+    if (mach_vm_region( mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&info, &count, &dummy_object_name ) != KERN_SUCCESS ||
+        address < 0x100000000)
+        return (void *)0x100000000;
+    return (void *)(((UINT_PTR)address + granularity_mask) & ~granularity_mask);
+}
+#endif
 
 static void mmap_init( const struct preload_info *preload_info )
 {
@@ -3922,6 +3944,10 @@ void virtual_init(void)
         for (i = 0; (*preload_info)[i].size; i++)
             mmap_add_reserved_area( (*preload_info)[i].addr, (*preload_info)[i].size );
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    address_space_start = get_host_address_floor();
+    TRACE( "address space start: %p\n", address_space_start );
+#endif
     mmap_init( preload_info ? *preload_info : NULL );
 
     if ((preload = getenv("WINEPRELOADRESERVE")))
