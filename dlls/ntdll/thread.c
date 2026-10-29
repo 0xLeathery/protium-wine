@@ -37,7 +37,7 @@ WINE_DECLARE_DEBUG_CHANNEL(pid);
 WINE_DECLARE_DEBUG_CHANNEL(timestamp);
 WINE_DECLARE_DEBUG_CHANNEL(microsecs);
 
-struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x7ffe0000;
+struct _KUSER_SHARED_DATA *user_shared_data = (void *)WINE_USER_SHARED_DATA_ADDR;
 
 struct debug_info
 {
