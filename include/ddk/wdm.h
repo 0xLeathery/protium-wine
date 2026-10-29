@@ -1243,6 +1243,14 @@ typedef enum _ALTERNATIVE_ARCHITECTURE_TYPE
 #define NX_SUPPORT_POLICY_OPTIN         2
 #define NX_SUPPORT_POLICY_OPTOUT        3
 
+#ifdef __WINESRC__
+/* User-mode address of KUSER_SHARED_DATA in Wine processes. configure overrides it, for both the
+ * Unix and the PE side, on hosts that can't map anything at the Windows address. */
+#ifndef WINE_USER_SHARED_DATA_ADDR
+#define WINE_USER_SHARED_DATA_ADDR 0x7ffe0000
+#endif
+#endif
+
 typedef struct _KUSER_SHARED_DATA {
     ULONG TickCountLowDeprecated;                          /* 0x000 */
     ULONG TickCountMultiplier;                             /* 0x004 */
