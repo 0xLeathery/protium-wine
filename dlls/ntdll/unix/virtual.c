@@ -78,6 +78,13 @@
 # include <mach/vm_map.h>
 #undef host_page_size
 #endif
+#if defined(__APPLE__) && defined(__aarch64__)
+/* arm64 macOS refuses mappings that are both writable and executable. Pages that are both in
+ * Windows terms are mapped writable, flipped to executable on an execute fault and back to
+ * writable on a write fault. */
+#define WX_EXCLUSIVE_HOST
+# include <libkern/OSCacheControl.h>
+#endif
 
 #if defined(HAVE_LINUX_USERFAULTFD_H) && defined(HAVE_LINUX_FS_H)
 # include <linux/userfaultfd.h>
@@ -1538,6 +1545,94 @@ static const char *get_prot_str( BYTE prot )
 }
 
 
+#ifdef WX_EXCLUSIVE_HOST
+/* Host pages that are writable and executable in Windows terms, and are currently mapped
+ * executable instead of writable: one byte per host page (at the index of its first page), in
+ * the 2-level layout of pages_vprot, allocated where a page is first flipped. The page
+ * protection byte has no bit left for this. Protected by virtual_mutex. */
+static BYTE **pages_wx_exec;
+
+/* whether the host prot of a page (or the union of a host page's pages) would be writable and executable */
+static inline BOOL is_wx_page( BYTE vprot )
+{
+    return (vprot & VPROT_COMMITTED) && !(vprot & (VPROT_GUARD | VPROT_WRITEWATCH)) && is_vprot_exec_write( vprot );
+}
+
+static BYTE *get_wx_exec_ptr( const void *addr, BOOL alloc )
+{
+    size_t idx = (size_t)ROUND_ADDR( addr, host_page_mask ) >> page_shift;
+    size_t chunk = idx >> pages_vprot_shift;
+    void *ptr;
+
+    if (chunk >= pages_vprot_size) return NULL;
+    if (!pages_wx_exec)
+    {
+        if (!alloc) return NULL;
+        ptr = anon_mmap_alloc( pages_vprot_size * sizeof(*pages_wx_exec), PROT_READ | PROT_WRITE );
+        if (ptr == MAP_FAILED) return NULL;
+        pages_wx_exec = ptr;
+    }
+    if (!pages_wx_exec[chunk])
+    {
+        if (!alloc) return NULL;
+        if ((ptr = anon_mmap_alloc( pages_vprot_mask + 1, PROT_READ | PROT_WRITE )) == MAP_FAILED) return NULL;
+        pages_wx_exec[chunk] = ptr;
+    }
+    return pages_wx_exec[chunk] + (idx & pages_vprot_mask);
+}
+
+/* record whether the host page at addr is to be mapped executable */
+static BOOL set_wx_exec( const void *addr, BOOL exec )
+{
+    BYTE *ptr = get_wx_exec_ptr( addr, exec );
+
+    if (ptr) *ptr = exec;
+    return ptr || !exec;
+}
+
+/* map the host pages in a range writable again, the default; for new and changed protections */
+static void clear_wx_exec( const void *addr, size_t size )
+{
+    const char *ptr = ROUND_ADDR( addr, host_page_mask ), *end = (const char *)addr + size;
+    size_t idx, count;
+
+    if (!pages_wx_exec) return;
+    while (ptr < end)
+    {
+        idx = (size_t)ptr >> page_shift;
+        if ((idx >> pages_vprot_shift) >= pages_vprot_size) break;
+        count = min( pages_vprot_mask + 1 - (idx & pages_vprot_mask), ((size_t)(end - ptr) + page_mask) >> page_shift );
+        if (pages_wx_exec[idx >> pages_vprot_shift])
+            memset( pages_wx_exec[idx >> pages_vprot_shift] + (idx & pages_vprot_mask), 0, count );
+        ptr += count << page_shift;
+    }
+}
+
+/* whether the exec+write host page at addr is mapped executable */
+static BOOL is_wx_exec( const void *addr, BYTE vprot )
+{
+    BYTE *ptr;
+
+    return is_wx_page( vprot ) && (ptr = get_wx_exec_ptr( addr, FALSE )) && *ptr;
+}
+
+/* the host prot of the host page at addr, from the get_unix_prot() of its pages' vprot union */
+static int get_wx_host_prot( const void *addr, BYTE vprot, int prot )
+{
+    if (!is_wx_exec( addr, vprot )) return prot;
+    return (prot & ~PROT_WRITE) | PROT_EXEC;
+}
+
+/* whether the page itself allows the access that faulted on its exec+write host page */
+static BOOL is_wx_access_allowed( BYTE vprot, BOOL exec )
+{
+    if (!(vprot & VPROT_COMMITTED) || (vprot & VPROT_GUARD)) return FALSE;
+    if (exec) return (vprot & VPROT_EXEC) != 0;
+    return (vprot & (VPROT_WRITE | VPROT_WRITECOPY)) && !(vprot & VPROT_WRITEWATCH);
+}
+#endif
+
+
 /***********************************************************************
  *           get_unix_prot
  *
@@ -1553,6 +1648,9 @@ static int get_unix_prot( BYTE vprot )
         if (vprot & VPROT_WRITECOPY) prot |= PROT_WRITE | PROT_READ;
         if (vprot & VPROT_EXEC) prot |= PROT_EXEC | PROT_READ;
         if (vprot & VPROT_WRITEWATCH) prot &= ~PROT_WRITE;
+#ifdef WX_EXCLUSIVE_HOST
+        if (is_wx_page( vprot )) prot &= ~PROT_EXEC;  /* writable until executed, see get_wx_host_prot() */
+#endif
     }
     if (!prot) prot = PROT_NONE;
     return prot;
@@ -1912,6 +2010,9 @@ static void delete_view( struct file_view *view ) /* [in] View */
 {
     if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
     set_page_vprot( view->base, view->size, 0 );
+#ifdef WX_EXCLUSIVE_HOST
+    clear_wx_exec( view->base, view->size );
+#endif
     if (view->protect & VPROT_ARM64EC) clear_arm64ec_range( view->base, view->size );
     unregister_view( view );
     free_view( view );
@@ -2078,10 +2179,16 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
 
     vprot = get_host_page_vprot( addr );
     prot = get_unix_prot( (vprot & ~clear) | set );
+#ifdef WX_EXCLUSIVE_HOST
+    prot = get_wx_host_prot( addr, (vprot & ~clear) | set, prot );
+#endif
     for (count = i = 1; i < size / host_page_size; i++, count++)
     {
         vprot = get_host_page_vprot( addr + count * host_page_size );
         next = get_unix_prot( (vprot & ~clear) | set );
+#ifdef WX_EXCLUSIVE_HOST
+        next = get_wx_host_prot( addr + count * host_page_size, (vprot & ~clear) | set, next );
+#endif
         if (next == prot) continue;
         if (mprotect_exec( addr, count * host_page_size, prot )) return -1;
         addr += count * host_page_size;
@@ -2110,6 +2217,9 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
         else if (use_kernel_writewatch && view->protect & VPROT_WRITEWATCH) vprot &= ~VPROT_WRITEWATCH;
         set_page_vprot( base, size, vprot );
     }
+#ifdef WX_EXCLUSIVE_HOST
+    clear_wx_exec( base, size );
+#endif
     return !mprotect_range( base, size, 0, 0 );
 }
 
@@ -4942,6 +5052,24 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
     }
 #endif
 
+#ifdef WX_EXCLUSIVE_HOST
+    if (is_wx_page( vprot ) && (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT) &&
+        is_wx_access_allowed( get_page_vprot( addr ), err == EXCEPTION_EXECUTE_FAULT ))
+    {
+        BOOL exec = (err == EXCEPTION_EXECUTE_FAULT);
+
+        /* Flip the host page the way the access needs it. Another thread may have flipped it
+         * already, or the flip may have been undone; mapping it the same way again is harmless. */
+        TRACE( "flipping %p to %s\n", page, exec ? "executable" : "writable" );
+        if (set_wx_exec( page, exec ) && !mprotect_range( page, host_page_size, 0, 0 ))
+        {
+            if (exec) sys_icache_invalidate( page, host_page_size );
+            ret = STATUS_SUCCESS;
+        }
+        else ERR( "failed to map %p %s\n", page, exec ? "executable" : "writable" );
+    }
+    else
+#endif
     if (!is_inside_signal_stack( stack ) && (vprot & VPROT_GUARD))
     {
         struct thread_stack_info stack_info;
@@ -5042,6 +5170,9 @@ static NTSTATUS check_write_access( void *base, size_t size, BOOL *has_write_wat
 {
     size_t i;
     char *addr = ROUND_ADDR( base, host_page_mask );
+#ifdef WX_EXCLUSIVE_HOST
+    BOOL wx_exec = FALSE;
+#endif
 
     size = ROUND_SIZE( base, size, host_page_mask );
     for (i = 0; i < size; i += host_page_size)
@@ -5050,7 +5181,18 @@ static NTSTATUS check_write_access( void *base, size_t size, BOOL *has_write_wat
         if (vprot & VPROT_WRITEWATCH) *has_write_watch = TRUE;
         if (!(get_unix_prot( vprot & ~VPROT_WRITEWATCH ) & PROT_WRITE))
             return STATUS_INVALID_USER_BUFFER;
+#ifdef WX_EXCLUSIVE_HOST
+        if (is_wx_exec( addr + i, vprot & ~VPROT_WRITEWATCH )) wx_exec = TRUE;
+#endif
     }
+#ifdef WX_EXCLUSIVE_HOST
+    /* the range is written with signals blocked, where a write fault can't flip a page */
+    if (wx_exec)
+    {
+        clear_wx_exec( addr, size );
+        if (!*has_write_watch) mprotect_range( addr, size, 0, 0 );
+    }
+#endif
     if (*has_write_watch)
         mprotect_range( addr, size, 0, VPROT_WRITEWATCH );  /* temporarily enable write access */
     return STATUS_SUCCESS;
