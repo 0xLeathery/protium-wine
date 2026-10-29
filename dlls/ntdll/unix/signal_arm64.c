@@ -1170,6 +1170,19 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { EXCEPTION_DATATYPE_MISALIGNMENT };
+#ifdef __APPLE__
+    DWORD64 esr = get_fault_esr( sigcontext );
+    DWORD64 ec = (esr >> 26) & 0x3f;
+
+    /* macOS raises SIGBUS for accesses that the protection of a mapped page forbids, such as the
+     * execute and write faults that flip exec+write pages. Only data aborts (EC 0x24, 0x25) with
+     * the alignment fault status (0x21) are misalignments. */
+    if ((ec != 0x24 && ec != 0x25) || (esr & 0x3f) != 0x21)
+    {
+        segv_handler( signal, siginfo, sigcontext );
+        return;
+    }
+#endif
 
     setup_exception( sigcontext, &rec );
 }
