@@ -8407,7 +8407,7 @@ NTSTATUS WINAPI NtSetInformationObject( HANDLE handle, OBJECT_INFORMATION_CLASS 
 }
 
 
-NTSTATUS WINAPI unixcall_compat_wine_nt_to_unix_file_name( void *args )
+NTSTATUS unixcall_compat_wine_nt_to_unix_file_name( void *args )
 {
     struct compat_wine_nt_to_unix_file_name_params *p = args;
     const OBJECT_ATTRIBUTES *attr = p->attr;
