@@ -65,6 +65,30 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
 
+#ifdef __APPLE__
+/* The macOS kernel doesn't preserve x18 (it zeroes it on context switches), so PE code finds the
+ * TEB in a TSD slot of TPIDRRO_EL0 instead: slot 6, which Apple leaves unused for Windows code.
+ * configure defines the slot for both the Unix and the PE side. */
+#ifndef WINE_TEB_TSD_SLOT
+#error WINE_TEB_TSD_SLOT must be defined on macOS
+#endif
+#define TEB_TSD_STR2(x) #x
+#define TEB_TSD_STR(x) TEB_TSD_STR2(x)
+/* load the TEB into reg, as NtCurrentTeb() does in PE code */
+#define LOAD_TEB(reg) "mrs " reg ", tpidrro_el0\n\t" \
+                      "and " reg ", " reg ", #0xfffffffffffffff8\n\t" \
+                      "ldr " reg ", [" reg ", #(" TEB_TSD_STR(WINE_TEB_TSD_SLOT) " * 8)]\n\t"
+
+static void set_teb_tsd_slot( TEB *teb )
+{
+    void **tsd;
+
+    __asm__ volatile( "mrs %0, tpidrro_el0" : "=r" (tsd) );
+    tsd = (void **)((ULONG_PTR)tsd & ~(ULONG_PTR)7);  /* the low bits may hold the CPU number */
+    tsd[WINE_TEB_TSD_SLOT] = teb;
+}
+#endif
+
 struct arm64_thread_data
 {
     BOOL suspend_pending;
@@ -894,6 +918,18 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
                    "mrs x1, fpcr\n\t"
                    "mrs x2, fpsr\n\t"
                    "bfi x1, x2, #0, #32\n\t"
+#ifdef __APPLE__
+                   /* x18 isn't preserved, use the teb argument */
+                   "ldr x2, [x4]\n\t"             /* teb->Tib.ExceptionList */
+                   "stp x1, x2, [x29, #0xb0]\n\t"
+
+                   "ldr x7, [x4, #0x378]\n\t"     /* thread_data->syscall_frame */
+                   "sub x1, sp, #0x330\n\t"       /* sizeof(struct syscall_frame) */
+                   "str x1, [x4, #0x378]\n\t"     /* thread_data->syscall_frame */
+                   "add x8, x29, #0xd0\n\t"
+                   "stp x7, x8, [x1, #0x110]\n\t" /* frame->prev_frame,syscall_cfa */
+                   "ldr w11, [x4, #0x380]\n\t"    /* thread_data->syscall_trace */
+#else
                    "ldr x2, [x18]\n\t"            /* teb->Tib.ExceptionList */
                    "stp x1, x2, [x29, #0xb0]\n\t"
 
@@ -903,11 +939,16 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
                    "add x8, x29, #0xd0\n\t"
                    "stp x7, x8, [x1, #0x110]\n\t" /* frame->prev_frame,syscall_cfa */
                    "ldr w11, [x18, #0x380]\n\t"   /* thread_data->syscall_trace */
+#endif
                    "cbnz x11, 1f\n\t"
                    /* switch to user stack */
                    "mov sp, x0\n\t"               /* user_sp */
                    "br x3\n"
+#ifdef __APPLE__
+                   "1:\tmov x19, x4\n\t"          /* teb */
+#else
                    "1:\tmov x19, x18\n\t"         /* teb */
+#endif
                    "mov x20, x0\n\t"              /* user_sp */
                    "mov x21, x3\n\t"              /* func */
                    "mov sp, x1\n\t"
@@ -1511,6 +1552,9 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     I386_CONTEXT *i386_context;
     ARM_CONTEXT *arm_context;
 
+#ifdef __APPLE__
+    set_teb_tsd_slot( teb );  /* before any PE code runs on this thread */
+#endif
     context.X0  = (DWORD64)entry;
     context.X1  = (DWORD64)arg;
     context.X18 = (DWORD64)teb;
@@ -1611,8 +1655,14 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
  */
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "hint 34\n\t" /* bti c */
+#ifdef __APPLE__
+                   LOAD_TEB("x11")              /* x18 isn't preserved, keep the teb in x11 */
+                   "ldr x10, [x11, #0x378]\n\t" /* thread_data->syscall_frame */
+                   "stp x11, x19, [x10, #0x90]\n\t" /* frame->x[18] = teb */
+#else
                    "ldr x10, [x18, #0x378]\n\t" /* thread_data->syscall_frame */
                    "stp x18, x19, [x10, #0x90]\n\t"
+#endif
                    "stp x20, x21, [x10, #0xa0]\n\t"
                    "stp x22, x23, [x10, #0xb0]\n\t"
                    "stp x24, x25, [x10, #0xc0]\n\t"
@@ -1662,7 +1712,11 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    __ASM_CFI(".cfi_offset 28, -0x68\n\t")
                    "and x20, x8, #0xfff\n\t"    /* syscall number */
                    "ubfx x21, x8, #12, #2\n\t"  /* syscall table number */
+#ifdef __APPLE__
+                   "ldr x16, [x11, #0x370]\n\t" /* thread_data->syscall_table */
+#else
                    "ldr x16, [x18, #0x370]\n\t" /* thread_data->syscall_table */
+#endif
                    "add x21, x16, x21, lsl #5\n\t"
                    "ldr x16, [x21, #16]\n\t"    /* table->ServiceLimit */
                    "cmp x20, x16\n\t"
@@ -1680,7 +1734,11 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "cbnz x9, 1b\n"
                    "2:\tldr x16, [x21]\n\t"     /* table->ServiceTable */
                    "ldr x23, [x16, x20, lsl 3]\n\t"
+#ifdef __APPLE__
+                   "ldr w11, [x11, #0x380]\n\t" /* thread_data->syscall_trace */
+#else
                    "ldr w11, [x18, #0x380]\n\t" /* thread_data->syscall_trace */
+#endif
                    "cbnz x11, " __ASM_LOCAL_LABEL("trace_syscall") "\n\t"
                    "blr x23\n\t"
                    "mov sp, x22\n"
@@ -1767,7 +1825,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
                    "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
 
 __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
+#ifdef __APPLE__
+                   LOAD_TEB("x11")
+                   "ldr w11, [x11, #0x380]\n\t" /* thread_data->syscall_trace */
+#else
                    "ldr w11, [x18, #0x380]\n\t" /* thread_data->syscall_trace */
+#endif
                    "cbnz x11, " __ASM_LOCAL_LABEL("trace_syscall_ret") "\n\t"
                    "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
 
@@ -1777,8 +1840,14 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
  */
 __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
                    "hint 34\n\t" /* bti c */
+#ifdef __APPLE__
+                   LOAD_TEB("x11")              /* x18 isn't preserved */
+                   "ldr x10, [x11, #0x378]\n\t" /* thread_data->syscall_frame */
+                   "stp x11, x19, [x10, #0x90]\n\t" /* frame->x[18] = teb */
+#else
                    "ldr x10, [x18, #0x378]\n\t" /* thread_data->syscall_frame */
                    "stp x18, x19, [x10, #0x90]\n\t"
+#endif
                    "stp x20, x21, [x10, #0xa0]\n\t"
                    "stp x22, x23, [x10, #0xb0]\n\t"
                    "stp x24, x25, [x10, #0xc0]\n\t"
