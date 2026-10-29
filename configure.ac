@@ -194,6 +194,14 @@ case "$host_os-$HOST_ARCH" in
   darwin*-aarch64) wine_user_shared_data_cflags="-DWINE_USER_SHARED_DATA_ADDR=0x7ffe00000000" ;;
 esac
 
+dnl The arm64 macOS kernel doesn't preserve x18, so aarch64 PE code can't find the TEB there. It reads
+dnl it from TSD slot 6 of TPIDRRO_EL0 instead, which Apple leaves unused for Windows code. The Unix
+dnl side sets the slot and its dispatchers read it, so both sides get the same define.
+wine_teb_tsd_cflags=""
+case "$host_os-$HOST_ARCH" in
+  darwin*-aarch64) wine_teb_tsd_cflags="-DWINE_TEB_TSD_SLOT=6" ;;
+esac
+
 m4_set_add_all([_AC_SUBST_VARS],[HOST_ARCH]m4_foreach([cpu],[aarch64,arm,arm64ec,i386,x86_64],
                                 [m4_foreach([var],[CC,CFLAGS,EXTRACFLAGS,CXXFLAGS,LDFLAGS,DEBUG,TARGET,STRIP,DELAYLOADFLAG,DISABLED_SUBDIRS],[,cpu[_]var])]))
 
@@ -460,6 +468,11 @@ do
              AS_VAR_APPEND([${wine_arch}_EXTRACFLAGS],[" $wine_user_shared_data_cflags"])
          fi ;;
     esac
+    dnl Only aarch64 PE code reads the TEB from the TSD slot
+    if test "$wine_arch" = aarch64 && test -n "$wine_teb_tsd_cflags"
+    then
+        AS_VAR_APPEND([${wine_arch}_EXTRACFLAGS],[" $wine_teb_tsd_cflags"])
+    fi
 
     target=""
     set x $CC
@@ -972,7 +985,7 @@ case $host_os in
         dnl so keep the linker defaults for both.
         wine_use_preloader=no
         WINELOADER_LDFLAGS="-Wl,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
-        EXTRACFLAGS="$EXTRACFLAGS $wine_user_shared_data_cflags"
+        EXTRACFLAGS="$EXTRACFLAGS $wine_user_shared_data_cflags $wine_teb_tsd_cflags"
         ;;
       x86_64)
         dnl If the -no_huge linker option is present (added in Xcode 15.3), use zerofill sections instead of the preloader
