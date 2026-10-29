@@ -40,6 +40,14 @@
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
 
+#ifdef WINE_TEB_TSD_SLOT
+/* The host doesn't preserve x18 (macOS): load the TEB from its TSD slot into reg, as NtCurrentTeb() does. */
+#define TEB_TSD_STR2(x) #x
+#define TEB_TSD_STR(x) TEB_TSD_STR2(x)
+#define LOAD_TEB(reg) "mrs " reg ", tpidrro_el0\n\t" \
+                      "and " reg ", " reg ", #0xfffffffffffffff8\n\t" \
+                      "ldr " reg ", [" reg ", #(" TEB_TSD_STR(WINE_TEB_TSD_SLOT) " * 8)]\n\t"
+#endif
 
 /*******************************************************************
  *         syscalls
@@ -70,7 +78,12 @@ __ASM_GLOBAL_FUNC( RtlCaptureContext,
                     "stp x11, x12, [x0, #0x60]\n\t"  /* context->X11,X12 */
                     "stp x13, x14, [x0, #0x70]\n\t"  /* context->X13,X14 */
                     "stp x15, x16, [x0, #0x80]\n\t"  /* context->X15,X16 */
+#ifdef WINE_TEB_TSD_SLOT
+                    LOAD_TEB("x1")
+                    "stp x17, x1, [x0, #0x90]\n\t"   /* context->X17,X18 (teb) */
+#else
                     "stp x17, x18, [x0, #0x90]\n\t"  /* context->X17,X18 */
+#endif
                     "stp x19, x20, [x0, #0xa0]\n\t"  /* context->X19,X20 */
                     "stp x21, x22, [x0, #0xb0]\n\t"  /* context->X21,X22 */
                     "stp x23, x24, [x0, #0xc0]\n\t"  /* context->X23,X24 */
@@ -375,7 +388,12 @@ __ASM_GLOBAL_FUNC( KiUserCallbackDispatcher,
                    ".seh_handler user_callback_handler, @except\n\t"
                    "ldr x0, [sp]\n\t"             /* args */
                    "ldp w1, w2, [sp, #0x08]\n\t"  /* len, id */
+#ifdef WINE_TEB_TSD_SLOT
+                   LOAD_TEB("x3")
+                   "ldr x3, [x3, 0x60]\n\t"       /* peb */
+#else
                    "ldr x3, [x18, 0x60]\n\t"      /* peb */
+#endif
                    "ldr x3, [x3, 0x58]\n\t"       /* peb->KernelCallbackTable */
                    "ldr x15, [x3, x2, lsl #3]\n\t"
                    "blr x15\n\t"
@@ -855,7 +873,12 @@ __ASM_GLOBAL_FUNC( RtlRaiseException,
                    "ldr w2, [x1]\n\t"            /* context->ContextFlags */
                    "orr w2, w2, #0x20000000\n\t" /* CONTEXT_UNWOUND_TO_CALL */
                    "str w2, [x1]\n\t"
+#ifdef WINE_TEB_TSD_SLOT
+                   LOAD_TEB("x3")
+                   "ldr x3, [x3, #0x60]\n\t"     /* peb */
+#else
                    "ldr x3, [x18, #0x60]\n\t"    /* peb */
+#endif
                    "ldrb w2, [x3, #2]\n\t"       /* peb->BeingDebugged */
                    "cbnz w2, 1f\n\t"
                    "bl dispatch_exception\n"
@@ -968,7 +991,12 @@ __ASM_GLOBAL_FUNC( DbgUiRemoteBreakin,
                    ".seh_save_fplr_x 16\n\t"
                    ".seh_endprologue\n\t"
                    ".seh_handler DbgUiRemoteBreakin_handler, @except\n\t"
+#ifdef WINE_TEB_TSD_SLOT
+                   LOAD_TEB("x0")
+                   "ldr x0, [x0, #0x60]\n\t"        /* NtCurrentTeb()->Peb */
+#else
                    "ldr x0, [x18, #0x60]\n\t"       /* NtCurrentTeb()->Peb */
+#endif
                    "ldrb w0, [x0, 0x02]\n\t"        /* peb->BeingDebugged */
                    "cbz w0, 1f\n\t"
                    "bl DbgBreakPoint\n"
