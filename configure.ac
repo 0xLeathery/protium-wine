@@ -951,6 +951,12 @@ case $host_os in
 
     case $HOST_ARCH in
       i386) wine_use_preloader=yes ;;
+      aarch64)
+        dnl arm64 macOS kills executables with a __PAGEZERO smaller than 4 GB and needs 16K segment alignment,
+        dnl so keep the linker defaults for both.
+        wine_use_preloader=no
+        WINELOADER_LDFLAGS="-Wl,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
+        ;;
       x86_64)
         dnl If the -no_huge linker option is present (added in Xcode 15.3), use zerofill sections instead of the preloader
         WINE_TRY_CFLAGS([-Wl,-no_huge],
