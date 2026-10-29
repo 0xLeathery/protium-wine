@@ -1550,6 +1550,16 @@ static NTSTATUS create_logical_proc_info(void)
 
 #elif defined(__APPLE__)
 
+/* no sysfs on macOS: WINE_CPU_TOPOLOGY falls back to plain CPU counts */
+static BOOL sysfs_parse_bitmap(const char *filename, ULONG_PTR *mask)
+{
+    return FALSE;
+}
+
+static void fill_performance_core_info(void)
+{
+}
+
 /* for 'data', max_len is the array count. for 'dataex', max_len is in bytes */
 static NTSTATUS create_logical_proc_info(void)
 {
