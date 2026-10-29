@@ -310,6 +310,8 @@ static const UINT_PTR host_page_mask = 0xfff;
 /* Note: these are Windows limits, you cannot change them. */
 #if defined(__i386__) || defined(__x86_64__)
 static void *address_space_start = (void *)0x110000; /* keep DOS area clear */
+#elif defined(__APPLE__) && defined(__aarch64__)
+static void *address_space_start = (void *)0x100000000; /* nothing can be mapped below 4 GB */
 #else
 static void *address_space_start = (void *)0x10000;
 #endif
@@ -330,7 +332,7 @@ static const ptrdiff_t max_try_map_step = 0x40000000;
 static BOOL increase_try_map_step = TRUE;
 
 ULONG_PTR user_space_wow_limit = 0;
-struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x7ffe0000;
+struct _KUSER_SHARED_DATA *user_shared_data = (void *)WINE_USER_SHARED_DATA_ADDR;
 
 /* TEB allocation blocks */
 static void *teb_block;
@@ -879,11 +881,17 @@ static void mmap_init( const struct preload_info *preload_info )
 
 #else
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* nothing can be mapped below 4 GB, and the top of the Windows address space is above the host
+     * limit: only reserve the relocated shared user data, before anything else can take it */
+    reserve_area( (void *)WINE_USER_SHARED_DATA_ADDR, (char *)WINE_USER_SHARED_DATA_ADDR + 0x10000 );
+#else
     if (preload_info) return;
     /* if we don't have a preloader, try to reserve the space now */
     reserve_area( (void *)0x000000010000, (void *)0x000068000000 );
     reserve_area( (void *)0x00007f000000, (void *)0x00007fff0000 );
     reserve_area( (void *)0x7ffffe000000, (void *)0x7fffffff0000 );
+#endif
 
 #endif
 }
@@ -4300,8 +4308,14 @@ TEB *virtual_alloc_first_teb(void)
         exit(1);
     }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* nothing can be mapped below 4 GB, so the TEBs can't be kept below 2 GB for wow64 */
+    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, 0, &total,
+                             MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+#else
     NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 ? limit_2g - 1 : 0, &total,
                              MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+#endif
     teb_block_pos = 30;
     ptr = (char *)teb_block + 30 * block_size;
     data_size = 2 * block_size;
@@ -5398,7 +5412,9 @@ void virtual_set_large_address_space(void)
     {
         if (!is_wow64())
         {
+#if !defined(__APPLE__) || !defined(__aarch64__)  /* nothing can be mapped below 4 GB */
             address_space_start = (void *)0x10000;
+#endif
 #ifndef __APPLE__  /* don't free the zerofill section on macOS */
             if ((main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) &&
                 (main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE))
