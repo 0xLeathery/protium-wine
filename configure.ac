@@ -186,6 +186,14 @@ case "$host_cpu" in
   i[[3456789]]86*) HOST_ARCH=i386 ;;
   x86_64)          HOST_ARCH=x86_64 ;;
 esac
+
+dnl arm64 macOS can't map anything below 4 GB, so KUSER_SHARED_DATA can't be at the Windows address
+dnl 0x7ffe0000. Unix and PE code must agree on its address, so both get the same define.
+wine_user_shared_data_cflags=""
+case "$host_os-$HOST_ARCH" in
+  darwin*-aarch64) wine_user_shared_data_cflags="-DWINE_USER_SHARED_DATA_ADDR=0x7ffe00000000" ;;
+esac
+
 m4_set_add_all([_AC_SUBST_VARS],[HOST_ARCH]m4_foreach([cpu],[aarch64,arm,arm64ec,i386,x86_64],
                                 [m4_foreach([var],[CC,CFLAGS,EXTRACFLAGS,CXXFLAGS,LDFLAGS,DEBUG,TARGET,STRIP,DELAYLOADFLAG,DISABLED_SUBDIRS],[,cpu[_]var])]))
 
@@ -444,6 +452,14 @@ do
     AS_VAR_COPY([CFLAGS],[${wine_arch}_CFLAGS])
     AS_VAR_COPY([LDFLAGS],[${wine_arch}_LDFLAGS])
     AS_VAR_SET([${wine_arch}_EXTRACFLAGS],["-D__WINE_PE_BUILD -Wall"])
+    dnl 32-bit PE code can't address KUSER_SHARED_DATA above 4 GB, so only 64-bit PE code gets the define
+    case $wine_arch in
+      i386|arm) ;;
+      *) if test -n "$wine_user_shared_data_cflags"
+         then
+             AS_VAR_APPEND([${wine_arch}_EXTRACFLAGS],[" $wine_user_shared_data_cflags"])
+         fi ;;
+    esac
 
     target=""
     set x $CC
@@ -956,6 +972,7 @@ case $host_os in
         dnl so keep the linker defaults for both.
         wine_use_preloader=no
         WINELOADER_LDFLAGS="-Wl,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
+        EXTRACFLAGS="$EXTRACFLAGS $wine_user_shared_data_cflags"
         ;;
       x86_64)
         dnl If the -no_huge linker option is present (added in Xcode 15.3), use zerofill sections instead of the preloader
