@@ -1224,7 +1224,7 @@ static const void *get_module_data_dir( HMODULE module, ULONG dir, ULONG *size )
 /**********************************************************************
  *      __wine_get_unix_env
  */
-NTSTATUS WINAPI wine_get_unix_env( void *args )
+NTSTATUS wine_get_unix_env( void *args )
 {
     struct wine_get_unix_env_params *params = args;
     unsigned int len;
@@ -1241,7 +1241,7 @@ NTSTATUS WINAPI wine_get_unix_env( void *args )
 /**********************************************************************
  *      __wine_set_unix_env
  */
-NTSTATUS WINAPI wine_set_unix_env( void *args )
+NTSTATUS wine_set_unix_env( void *args )
 {
     struct wine_set_unix_env_params *params = args;
 
