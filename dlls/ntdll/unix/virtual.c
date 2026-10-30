@@ -5426,6 +5426,30 @@ SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T
 }
 
 
+#ifdef WX_EXCLUSIVE_HOST
+/***********************************************************************
+ *           virtual_wx_prepare_write
+ *
+ * Map the exec+write pages of a buffer writable before the kernel writes into it (a server
+ * reply): the kernel fails with EFAULT on a page that is mapped executable instead.
+ */
+void virtual_wx_prepare_write( void *addr, SIZE_T size )
+{
+    char *ptr = ROUND_ADDR( addr, host_page_mask ), *end = (char *)addr + size;
+
+    if (!pages_wx_exec || !size) return;
+    mutex_lock( &virtual_mutex );  /* signals are blocked during server calls */
+    for ( ; ptr < end; ptr += host_page_size)
+    {
+        if (!is_wx_exec( ptr, get_host_page_vprot( ptr ))) continue;
+        set_wx_exec( ptr, FALSE );
+        mprotect_range( ptr, host_page_size, 0, 0 );
+    }
+    mutex_unlock( &virtual_mutex );
+}
+#endif
+
+
 /***********************************************************************
  *           virtual_uninterrupted_write_memory
  *
