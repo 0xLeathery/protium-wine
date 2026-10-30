@@ -280,6 +280,10 @@ static void read_reply_data( void *buffer, size_t size )
 static inline unsigned int wait_reply( struct __server_request_info *req )
 {
     read_reply_data( &req->u.reply, sizeof(req->u.reply) );
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* read() fails with EFAULT on exec+write pages that are mapped executable */
+    virtual_wx_prepare_write( req->reply_data, req->u.reply.reply_header.reply_size );
+#endif
     if (req->u.reply.reply_header.reply_size)
         read_reply_data( req->reply_data, req->u.reply.reply_header.reply_size );
     return req->u.reply.reply_header.error;
