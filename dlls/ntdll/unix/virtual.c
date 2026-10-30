@@ -7449,10 +7449,6 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
 }
 
 
-/***********************************************************************
- *             NtWriteVirtualMemory   (NTDLL.@)
- *             ZwWriteVirtualMemory   (NTDLL.@)
- */
 #ifdef WX_EXCLUSIVE_HOST
 /* Map the exec+write pages of a range of a process writable, by setting their protection again;
  * returns whether there were any. The server can't write into those that the process currently
@@ -7483,6 +7479,11 @@ static BOOL make_wx_pages_writable( HANDLE process, void *addr, SIZE_T size )
 }
 #endif
 
+
+/***********************************************************************
+ *             NtWriteVirtualMemory   (NTDLL.@)
+ *             ZwWriteVirtualMemory   (NTDLL.@)
+ */
 NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *buffer,
                                       SIZE_T size, SIZE_T *bytes_written )
 {
