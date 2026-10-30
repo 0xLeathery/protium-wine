@@ -53,7 +53,9 @@
 #ifdef __APPLE__
 # include <dlfcn.h>
 # include <stdbool.h>
+# include <sys/mman.h>
 # include <sys/time.h>
+# include <libkern/OSCacheControl.h>
 #endif
 
 #include "ntstatus.h"
@@ -73,6 +75,10 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
 struct arm64_thread_data
 {
     BOOL suspend_pending;
+#ifdef __APPLE__
+    ULONG64  wx_pc;       /* pc of the store that runs in wx_trampoline */
+    sigset_t wx_sigmask;  /* signal mask to restore after it */
+#endif
 };
 
 C_ASSERT( sizeof(struct arm64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
@@ -1112,6 +1118,186 @@ static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
 }
 
 
+#ifdef __APPLE__
+/* A store into the exec+write host page that holds the store itself runs from this trampoline
+ * instead, and brk instructions return to the store's own code. virtual_mutex stays held
+ * meanwhile, so one trampoline serves all threads. */
+#define WX_TRAMPOLINE_SLOTS 128
+static DWORD *wx_trampoline;
+static ULONG64 wx_orig[WX_TRAMPOLINE_SLOTS];  /* address of each copied instruction, or where an exit returns */
+static BOOL wx_exit[WX_TRAMPOLINE_SLOTS];     /* the slot is an exit (brk) */
+static const DWORD wx_brk = 0xd43ef420;       /* brk #0xf7a1 */
+
+static inline BOOL is_store_exclusive( DWORD insn ) { return (insn & 0x3fc00000) == 0x08000000; }
+static inline BOOL is_load_exclusive( DWORD insn ) { return (insn & 0x3fc00000) == 0x08400000; }
+
+/* the target of a b, b.cond, cbz/cbnz or tbz/tbnz; FALSE for other instructions */
+static BOOL get_branch_target( DWORD insn, ULONG64 pc, ULONG64 *target )
+{
+    if ((insn & 0xfc000000) == 0x14000000)  /* b */
+        *target = pc + ((LONG64)((ULONG64)(insn & 0x03ffffff) << 38) >> 36);
+    else if ((insn & 0xff000000) == 0x54000000 || (insn & 0x7e000000) == 0x34000000)  /* b.cond, cbz, cbnz */
+        *target = pc + ((LONG64)((ULONG64)((insn >> 5) & 0x7ffff) << 45) >> 43);
+    else if ((insn & 0x7e000000) == 0x36000000)  /* tbz, tbnz */
+        *target = pc + ((LONG64)((ULONG64)((insn >> 5) & 0x3fff) << 50) >> 48);
+    else return FALSE;
+    return TRUE;
+}
+
+/* the same branch with another offset, or 0 if it doesn't fit */
+static DWORD set_branch_offset( DWORD insn, LONG64 offset )
+{
+    if ((insn & 0xfc000000) == 0x14000000)
+        return (insn & 0xfc000000) | ((offset >> 2) & 0x03ffffff);
+    if ((insn & 0x7e000000) == 0x36000000)
+    {
+        if (offset < -0x8000 || offset >= 0x8000) return 0;
+        return (insn & ~0x0007ffe0) | (((offset >> 2) & 0x3fff) << 5);
+    }
+    if (offset < -0x100000 || offset >= 0x100000) return 0;
+    return (insn & ~0x00ffffe0) | (((offset >> 2) & 0x7ffff) << 5);
+}
+
+/* instructions that can't run from another address */
+static BOOL is_position_dependent( DWORD insn )
+{
+    return (insn & 0xfc000000) == 0x94000000 ||  /* bl */
+           (insn & 0xfe000000) == 0xd6000000 ||  /* br, blr, ret, eret */
+           (insn & 0x1f000000) == 0x10000000 ||  /* adr, adrp */
+           (insn & 0x3b000000) == 0x18000000;    /* ldr (literal), prfm (literal) */
+}
+
+/***********************************************************************
+ *           displace_store
+ *
+ * Run the store at pc from wx_trampoline, with the signals of server calls blocked.
+ *
+ * A store-exclusive can't run alone: the exception that brought us here cleared the exclusive
+ * monitor, so it would fail every time. Treat it as failed, which the architecture allows at any
+ * time, and run its retry loop (from the target of the backward branch after it to that branch)
+ * from the trampoline instead, where it doesn't fault.
+ */
+static BOOL displace_store( ucontext_t *context )
+{
+    struct arm64_thread_data *data = arm64_thread_data();
+    ULONG64 pc = PC_sig( context ), first = pc, last = pc, entry = pc, addr, target;
+    DWORD insn = *(DWORD *)pc, code[WX_TRAMPOLINE_SLOTS];
+    unsigned int i, count, slots;
+    size_t size = getpagesize();
+
+    if (is_store_exclusive( insn ))
+    {
+        if (((insn >> 16) & 0x1f) == 31) return FALSE;
+        for (addr = pc + 4; addr <= pc + 32; addr += 4)  /* the retry branch */
+        {
+            if (get_branch_target( *(DWORD *)addr, addr, &target ) && target <= pc && target + 4 * 60 >= pc) break;
+            if (is_position_dependent( *(DWORD *)addr )) return FALSE;
+        }
+        if (addr > pc + 32) return FALSE;
+        first = target;
+        last = addr;
+        entry = pc + 4;
+        for (addr = first; addr < pc; addr += 4) if (is_load_exclusive( *(DWORD *)addr )) break;
+        if (addr == pc) return FALSE;
+    }
+
+    /* copy first..last, then an exit to the instruction after last, then the exits of branches out */
+    count = (last - first) / 4 + 1;
+    slots = count + 1;
+    for (i = 0; i < count; i++)
+    {
+        addr = first + 4 * i;
+        insn = *(DWORD *)addr;
+        wx_orig[i] = addr;
+        wx_exit[i] = FALSE;
+        if (is_position_dependent( insn )) return FALSE;
+        if (get_branch_target( insn, addr, &target ) && (target < first || target > last))
+        {
+            if (slots == WX_TRAMPOLINE_SLOTS) return FALSE;
+            code[slots] = wx_brk;
+            wx_orig[slots] = target;
+            wx_exit[slots] = TRUE;
+            if (!(insn = set_branch_offset( insn, 4 * ((LONG64)slots - i) ))) return FALSE;
+            slots++;
+        }
+        code[i] = insn;
+    }
+    code[count] = wx_brk;
+    wx_orig[count] = last + 4;
+    wx_exit[count] = TRUE;
+
+    if (!wx_trampoline)
+    {
+        void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_EXEC );
+        if (ptr == MAP_FAILED) return FALSE;
+        wx_trampoline = ptr;
+    }
+    if (mprotect( wx_trampoline, size, PROT_READ | PROT_WRITE )) return FALSE;
+    memcpy( wx_trampoline, code, slots * sizeof(DWORD) );
+    if (mprotect( wx_trampoline, size, PROT_READ | PROT_EXEC )) return FALSE;
+    sys_icache_invalidate( wx_trampoline, slots * sizeof(DWORD) );
+
+    if (entry != pc) REGn_sig( (*(DWORD *)pc >> 16) & 0x1f, context ) = 1;  /* the store-exclusive failed */
+    data->wx_pc = pc;
+    data->wx_sigmask = context->uc_sigmask;
+    for (i = 1; i < NSIG; i++) if (sigismember( &server_block_set, i )) sigaddset( &context->uc_sigmask, i );
+    PC_sig( context ) = (ULONG_PTR)wx_trampoline + (entry - first);
+    return TRUE;
+}
+
+/* the trampoline slot the thread is at, or -1 if it isn't running a displaced store */
+static int get_displaced_slot( ucontext_t *context )
+{
+    ULONG_PTR pc = PC_sig( context );
+
+    if (!wx_trampoline || !arm64_thread_data()->wx_pc) return -1;
+    if (pc < (ULONG_PTR)wx_trampoline || pc >= (ULONG_PTR)(wx_trampoline + WX_TRAMPOLINE_SLOTS)) return -1;
+    return (pc - (ULONG_PTR)wx_trampoline) / sizeof(DWORD);
+}
+
+/* back to the store's own code, at the original address of the trampoline slot */
+static void end_displaced_store( ucontext_t *context, int slot )
+{
+    struct arm64_thread_data *data = arm64_thread_data();
+
+    PC_sig( context ) = wx_orig[slot];
+    context->uc_sigmask = data->wx_sigmask;
+    data->wx_pc = 0;
+    virtual_wx_end_displaced_store();
+}
+
+/***********************************************************************
+ *           handle_wx_store_fault
+ *
+ * Handle a write fault of a store into its own exec+write host page, which flipping the page
+ * can't resolve, by running the store elsewhere. Returns TRUE if the fault was handled.
+ */
+static BOOL handle_wx_store_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
+{
+    int slot = get_displaced_slot( context );
+
+    if (slot >= 0)
+    {
+        /* an instruction faulted in the trampoline: handle it, or raise it at its own address */
+        if (!virtual_handle_fault( rec, (void *)SP_sig(context) )) return TRUE;
+        end_displaced_store( context, slot );
+        setup_exception( context, rec );
+        return TRUE;
+    }
+    if (rec->ExceptionInformation[0] != EXCEPTION_WRITE_FAULT) return FALSE;
+    if (!virtual_wx_begin_displaced_store( (void *)PC_sig(context), (void *)rec->ExceptionInformation[1] ))
+        return FALSE;
+    if (displace_store( context )) return TRUE;
+    virtual_wx_end_displaced_store();
+    ERR( "can't run instruction %08x at %p, which writes into its own page, elsewhere\n",
+         *(DWORD *)PC_sig(context), (void *)PC_sig(context) );
+    rec->ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+    setup_exception( context, rec );
+    return TRUE;
+}
+#endif
+
+
 /**********************************************************************
  *		segv_handler
  *
@@ -1128,6 +1314,9 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     else if (esr & 0x40) rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
     else rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
     rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+#ifdef __APPLE__
+    if (handle_wx_store_fault( context, &rec )) return;
+#endif
     if (!virtual_handle_fault( &rec, (void *)SP_sig(context) )) return;
     if (handle_syscall_fault( context, &rec )) return;
     setup_exception( context, &rec );
@@ -1199,6 +1388,15 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     ucontext_t *context = sigcontext;
     CONTEXT ctx;
 
+#ifdef __APPLE__
+    int slot = get_displaced_slot( context );
+
+    if (slot >= 0 && wx_exit[slot])  /* a brk that leaves the trampoline */
+    {
+        end_displaced_store( context, slot );
+        return;
+    }
+#endif
     rec.ExceptionAddress = (void *)PC_sig(context);
     save_context( &ctx, sigcontext );
 
