@@ -5447,6 +5447,38 @@ void virtual_wx_prepare_write( void *addr, SIZE_T size )
     }
     mutex_unlock( &virtual_mutex );
 }
+
+
+/***********************************************************************
+ *           virtual_wx_begin_displaced_store
+ *
+ * A write fault at pc into the exec+write host page that holds pc itself can't be resolved by
+ * flipping the page: the store faults while the page is executable, and the next instruction
+ * fetch while it is writable. If that is the case, map the page writable and keep virtual_mutex
+ * held, so that no other thread flips it back, until the caller has run the store elsewhere and
+ * calls virtual_wx_end_displaced_store().
+ */
+BOOL virtual_wx_begin_displaced_store( const void *pc, const void *addr )
+{
+    char *page = ROUND_ADDR( addr, host_page_mask );
+
+    if (ROUND_ADDR( pc, host_page_mask ) != page) return FALSE;
+    mutex_lock( &virtual_mutex );
+    if (is_wx_page( get_host_page_vprot( page )) && is_wx_access_allowed( get_page_vprot( addr ), FALSE ) &&
+        set_wx_exec( page, FALSE ) && !mprotect_range( page, host_page_size, 0, 0 ))
+        return TRUE;
+    mutex_unlock( &virtual_mutex );
+    return FALSE;
+}
+
+
+/***********************************************************************
+ *           virtual_wx_end_displaced_store
+ */
+void virtual_wx_end_displaced_store(void)
+{
+    mutex_unlock( &virtual_mutex );
+}
 #endif
 
 
