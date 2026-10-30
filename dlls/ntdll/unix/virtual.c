@@ -7453,10 +7453,44 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
  *             NtWriteVirtualMemory   (NTDLL.@)
  *             ZwWriteVirtualMemory   (NTDLL.@)
  */
+#ifdef WX_EXCLUSIVE_HOST
+/* Map the exec+write pages of a range of a process writable, by setting their protection again;
+ * returns whether there were any. The server can't write into those that the process currently
+ * maps executable. */
+static BOOL make_wx_pages_writable( HANDLE process, void *addr, SIZE_T size )
+{
+    char *ptr = ROUND_ADDR( addr, page_mask ), *end = (char *)addr + size, *region_end;
+    MEMORY_BASIC_INFORMATION info;
+    SIZE_T len;
+    ULONG old;
+    void *base;
+    BOOL ret = FALSE;
+
+    while (ptr < end)
+    {
+        if (NtQueryVirtualMemory( process, ptr, MemoryBasicInformation, &info, sizeof(info), NULL )) break;
+        region_end = min( end, (char *)info.BaseAddress + info.RegionSize );
+        if (info.State == MEM_COMMIT &&
+            (info.Protect == PAGE_EXECUTE_READWRITE || info.Protect == PAGE_EXECUTE_WRITECOPY))
+        {
+            base = ptr;
+            len = region_end - ptr;
+            if (!NtProtectVirtualMemory( process, &base, &len, info.Protect, &old )) ret = TRUE;
+        }
+        ptr = region_end;
+    }
+    return ret;
+}
+#endif
+
 NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *buffer,
                                       SIZE_T size, SIZE_T *bytes_written )
 {
     unsigned int status;
+#ifdef WX_EXCLUSIVE_HOST
+    SIZE_T total = size;
+    int retries;
+#endif
 
     if (virtual_check_buffer_for_read( buffer, size ))
     {
@@ -7469,6 +7503,23 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
             size = reply->written;
         }
         SERVER_END_REQ;
+#ifdef WX_EXCLUSIVE_HOST
+        /* the target may map exec+write pages executable; a thread of it can flip them back
+         * before the write, so try again a few times */
+        for (retries = 0; status == STATUS_ACCESS_DENIED && retries < 3 &&
+                          make_wx_pages_writable( process, addr, total ); retries++)
+        {
+            SERVER_START_REQ( write_process_memory )
+            {
+                req->handle     = wine_server_obj_handle( process );
+                req->addr       = wine_server_client_ptr( addr );
+                wine_server_add_data( req, buffer, total );
+                status = wine_server_call( req );
+                size = reply->written;
+            }
+            SERVER_END_REQ;
+        }
+#endif
     }
     else
     {
