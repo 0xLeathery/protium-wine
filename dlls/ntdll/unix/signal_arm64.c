@@ -1184,16 +1184,19 @@ static BOOL displace_store( ucontext_t *context )
     DWORD insn = *(DWORD *)pc, code[WX_TRAMPOLINE_SLOTS];
     unsigned int i, count, slots;
     size_t size = getpagesize();
+    /* only read code in the host page of the store, which the caller mapped readable */
+    ULONG64 page_start = pc & ~(ULONG64)(size - 1), page_end = page_start + size;
 
     if (is_store_exclusive( insn ))
     {
         if (((insn >> 16) & 0x1f) == 31) return FALSE;
-        for (addr = pc + 4; addr <= pc + 32; addr += 4)  /* the retry branch */
+        for (addr = pc + 4; addr <= pc + 32 && addr < page_end; addr += 4)  /* the retry branch */
         {
-            if (get_branch_target( *(DWORD *)addr, addr, &target ) && target <= pc && target + 4 * 60 >= pc) break;
+            if (get_branch_target( *(DWORD *)addr, addr, &target ) && target <= pc &&
+                target + 4 * 60 >= pc && target >= page_start) break;
             if (is_position_dependent( *(DWORD *)addr )) return FALSE;
         }
-        if (addr > pc + 32) return FALSE;
+        if (addr > pc + 32 || addr >= page_end) return FALSE;
         first = target;
         last = addr;
         entry = pc + 4;
