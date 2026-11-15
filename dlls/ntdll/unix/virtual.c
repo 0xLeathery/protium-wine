@@ -3139,6 +3139,14 @@ static NTSTATUS map_pe_header( void *ptr, size_t size, size_t map_size, int fd, 
  */
 static void *get_host_addr_space_limit(void)
 {
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* The address space ends at MACH_VM_MAX_ADDRESS_RAW (xnu osfmk/mach/arm/vm_param.h). The
+     * probe below would find 0x7fffffff0000, as a mapping with a hint up to there succeeds
+     * elsewhere, and every allocation tried in between fails. Stay 16MB below the end:
+     * copyinstr() validates the full maximum length, so exec fails with EFAULT when argument
+     * or environment strings, e.g. on a thread stack, are near it. */
+    return (void *)(0x7ffffe000000 - 0x1000000);
+#else
     unsigned int flags = MAP_PRIVATE | MAP_ANON;
     UINT_PTR addr = (UINT_PTR)1 << 63;
 
@@ -3158,6 +3166,7 @@ static void *get_host_addr_space_limit(void)
         addr >>= 1;
     }
     return (void *)((addr << 1) - (granularity_mask + 1));
+#endif
 }
 
 #endif /* _WIN64 */
