@@ -100,6 +100,9 @@ static struct wine_preload_info low_reserve[] =
 /* ntdll stops at the first entry of size 0, so the 4GB - loader entry, which stays 0 when
  * it cannot be mapped, must remain the last one before the terminator. */
 
+/* set when exec_with_4k_pages() found that nothing can be mapped below 4GB */
+static int no_low_memory;
+
 __attribute((visibility("default"))) struct r_debug *wine_r_debug = NULL;
 const __attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = NULL;
 
@@ -107,6 +110,7 @@ static void init_reserved_areas(void)
 {
     char *loader = (char *)((uintptr_t)&_mh_execute_header & ~(uintptr_t)0xffff);
 
+    if (no_low_memory) return;
     if (mmap( low_reserve[0].addr, low_reserve[0].size, PROT_NONE,
               MAP_FIXED | MAP_NORESERVE | MAP_PRIVATE | MAP_ANON, -1, 0 ) != low_reserve[0].addr)
         return;
@@ -323,7 +327,10 @@ static void exec_with_4k_pages( char *argv[] )
     }
     else if (mmap( low_reserve[0].addr, 0x4000, PROT_NONE,
                    MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0 ) != low_reserve[0].addr)
-        return;  /* no cross-architecture entitlement */
+    {
+        no_low_memory = 1;  /* no cross-architecture entitlement */
+        return;
+    }
     else
     {
         snprintf( buffer, sizeof(buffer), "%d", slide_execs );
