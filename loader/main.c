@@ -76,6 +76,50 @@ static void init_reserved_areas(void)
 
 #else
 
+#if defined(__APPLE__) && defined(__aarch64__)
+
+#include <errno.h>
+#include <mach-o/ldsyms.h>
+#include <spawn.h>
+
+/* arm64 macOS normally refuses mappings below 4GB. With the cross-architecture entitlement
+ * the kernel keeps only one hard page of the 4GB __PAGEZERO and maps the rest as a
+ * replaceable PROT_NONE region, which nothing else can have claimed before main() runs.
+ * Turn it into Wine's low reserved area. Without the entitlement the mapping fails and there
+ * is no reserved area, as before.
+ * The kernel slides the loader by a random amount above 4GB and covers the area from 4GB up
+ * to it with the same kind of replaceable mapping. Wine only maps over such a mapping in a
+ * reserved area, so reserve that area too: executables at 0x100000000 without relocations,
+ * as old x64 linkers made them, can only load there. */
+static struct wine_preload_info low_reserve[] =
+{
+    { (void *)0x10000, 0x100000000 - 0x10000 },  /* 64KB - 4GB */
+    { (void *)0x100000000, 0 },                   /* 4GB - loader, set in init_reserved_areas */
+    { 0, 0 }                                      /* end of list */
+};
+/* ntdll stops at the first entry of size 0, so the 4GB - loader entry, which stays 0 when
+ * it cannot be mapped, must remain the last one before the terminator. */
+
+__attribute((visibility("default"))) struct r_debug *wine_r_debug = NULL;
+const __attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = NULL;
+
+static void init_reserved_areas(void)
+{
+    char *loader = (char *)((uintptr_t)&_mh_execute_header & ~(uintptr_t)0xffff);
+
+    if (mmap( low_reserve[0].addr, low_reserve[0].size, PROT_NONE,
+              MAP_FIXED | MAP_NORESERVE | MAP_PRIVATE | MAP_ANON, -1, 0 ) != low_reserve[0].addr)
+        return;
+    wine_main_preload_info = low_reserve;
+
+    if (loader > (char *)low_reserve[1].addr &&
+        mmap( low_reserve[1].addr, loader - (char *)low_reserve[1].addr, PROT_NONE,
+              MAP_FIXED | MAP_NORESERVE | MAP_PRIVATE | MAP_ANON, -1, 0 ) == low_reserve[1].addr)
+        low_reserve[1].size = loader - (char *)low_reserve[1].addr;
+}
+
+#else
+
 /* the preloader will set these variables */
 __attribute((visibility("default"))) struct r_debug *wine_r_debug = NULL;
 const __attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = NULL;
@@ -83,6 +127,8 @@ const __attribute((visibility("default"))) struct wine_preload_info *wine_main_p
 static void init_reserved_areas(void)
 {
 }
+
+#endif
 
 #endif
 
@@ -188,6 +234,109 @@ static void *try_dlopen( const char *argv0 )
 }
 
 
+#if defined(__APPLE__) && defined(__aarch64__)
+
+extern char **environ;
+
+static const char exec_marker[] = "__WINE_4K_EXEC";
+#define MIN_LOADER_GAP  0x2000000  /* see exec_with_4k_pages */
+#define MAX_SLIDE_EXECS 8
+
+/* exec the loader with 4K pages and exec_marker set to value; returns an error on failure */
+static int exec_self_4k( char *argv[], const char *value, const char **call )
+{
+    posix_spawnattr_t attr;
+    char *exe;
+    int err;
+
+    errno = 0;
+    *call = "executable path";
+    if (!(exe = (char *)get_self_exe()))
+        return errno ? errno : ENAMETOOLONG;  /* _NSGetExecutablePath sets no errno */
+
+    *call = "posix_spawnattr_init";
+    if (!(err = posix_spawnattr_init( &attr )))
+    {
+        if ((err = posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETEXEC )))
+            *call = "posix_spawnattr_setflags";
+        else if ((err = posix_spawnattr_set_4k_page_size_np( &attr )))
+            *call = "posix_spawnattr_set_4k_page_size_np";
+        else if (setenv( exec_marker, value, 1 ))
+        {
+            *call = "setenv";
+            err = errno;
+        }
+        else
+        {
+            *call = "posix_spawn";
+            err = posix_spawn( NULL, exe, NULL, &attr, argv, environ );
+            unsetenv( exec_marker );
+        }
+        posix_spawnattr_destroy( &attr );
+    }
+    free( exe );
+    return err;
+}
+
+/* Windows code expects 4K pages, and on 16K pages Wine has to merge four of them into one
+ * host page. The kernel grants a process 4K pages at exec time when its binary has the
+ * cross-architecture entitlement, so re-exec the loader with them, before anything is
+ * mapped. A forked child keeps the page size; a plain exec drops it and comes back here.
+ * ntdll starts new Wine processes with 4K pages when it has them, so for the page size this
+ * exec only runs for a loader started from outside Wine, or through a plain exec such as a
+ * Unix spawn. A binary without the entitlement would be killed in that exec, with no
+ * message, so first check that the low 4GB can be mapped, which only the entitlement allows.
+ * Without it the loader goes on with the host's 16K pages and no memory below 4GB, which is
+ * how it runs when it is signed without a provisioning profile.
+ * With 4K pages, the loader also execs itself again, keeping them, for a new slide when the
+ * kernel put it less than 32MB above 4GB, too close for most executables at 0x100000000 (see
+ * init_reserved_areas). The slide is random up to about 80MB and falls into one of three
+ * bands, the lowest of which ends at 16MB, so that happens for about one start in three.
+ * __WINE_4K_EXEC marks a re-exec'd loader, so that it stops instead of exec'ing again if the
+ * page size did not change, and counts the execs for a new slide, so that every loader tries
+ * at most MAX_SLIDE_EXECS of them. It is removed at once, so no child inherits it. If an exec
+ * for a new slide fails, the loader keeps the slide it has. */
+static void exec_with_4k_pages( char *argv[] )
+{
+    const char *value = getenv( exec_marker ), *call, *reason = NULL;
+    int err = 0, reexec = value != NULL, slide_execs = value ? atoi( value ) : 0;
+    char buffer[16];
+
+    unsetenv( exec_marker );
+    if (sysconf( _SC_PAGESIZE ) == 0x1000)
+    {
+        if (slide_execs >= MAX_SLIDE_EXECS ||
+            (char *)&_mh_execute_header - (char *)0x100000000 >= MIN_LOADER_GAP)
+            return;
+        snprintf( buffer, sizeof(buffer), "%d", slide_execs + 1 );
+        err = exec_self_4k( argv, buffer, &call );
+        fprintf( stderr, "wine: %s for a new loader slide failed: %s, keeping this one\n",
+                 call, strerror( err ));
+        return;
+    }
+
+    errno = 0;
+    if (reexec)
+    {
+        call = "exec with 4K pages";
+        reason = "the page size is still not 4K";
+    }
+    else if (mmap( low_reserve[0].addr, 0x4000, PROT_NONE,
+                   MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0 ) != low_reserve[0].addr)
+        return;  /* no cross-architecture entitlement */
+    else
+    {
+        snprintf( buffer, sizeof(buffer), "%d", slide_execs );
+        err = exec_self_4k( argv, buffer, &call );
+    }
+
+    fprintf( stderr, "wine: %s failed: %s\n", call, reason ? reason : strerror( err ));
+    fprintf( stderr, "wine: the loader has the cross-architecture entitlement but can't get 4K pages\n" );
+    exit(1);
+}
+
+#endif
+
 /**********************************************************************
  *           main
  */
@@ -195,6 +344,9 @@ int main( int argc, char *argv[] )
 {
     void *handle;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    exec_with_4k_pages( argv );
+#endif
     init_reserved_areas();
 
     if ((handle = try_dlopen( get_self_exe() )) ||
