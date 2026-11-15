@@ -176,6 +176,9 @@ struct macdrv_win_data
 {
     HWND                hwnd;                   /* hwnd that this private data belongs to */
     macdrv_window       cocoa_window;
+#if defined(__APPLE__) && defined(__aarch64__)
+    macdrv_view         d3dmetal_unused_view;   /* keeps client_view where DXMT reads it, see macdrv_functions */
+#endif
     macdrv_view         client_view;
     struct window_rects rects;                  /* window rects in monitor DPI, relative to parent client area */
     int                 pixel_format;           /* pixel format for GL */
@@ -187,6 +190,10 @@ struct macdrv_win_data
     unsigned int        per_pixel_alpha : 1;    /* is window using per-pixel alpha? */
     unsigned int        minimized : 1;          /* is window minimized? */
     unsigned int        fullscreen : 1;         /* is the window visible rect fullscreen? (unrelated to native AppKit/Cocoa fullscreen) */
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct client_surface **d3dmetal_surfaces;  /* client surfaces created through macdrv_functions */
+    unsigned int        d3dmetal_surface_count;
+#endif
 };
 
 struct macdrv_client_surface

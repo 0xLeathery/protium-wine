@@ -1167,6 +1167,81 @@ struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd)
     return surface;
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+
+/* DXMT, Direct3D on Metal, puts its frames into a window through winemac.drv: its Unix library
+ * looks up "macdrv_functions" with dlsym() and reads the table, and the window data that
+ * get_win_data returns, with the layout of CrossOver's winemac.drv. Of the window data it reads
+ * hwnd, cocoa_window and the fourth field, the view of the window's client area, in which it
+ * creates a metal view. It never creates, shows or sizes that client view itself.
+ * So get_win_data creates a client surface for the window on every call, which makes its view
+ * the window's client view, shown and sized to the client area, and the window keeps the surface
+ * until it is destroyed. The surfaces are not in win32u's list of the window's client surfaces,
+ * which only win32u can add to. */
+
+C_ASSERT( offsetof(struct macdrv_win_data, hwnd) == 0 );
+C_ASSERT( offsetof(struct macdrv_win_data, cocoa_window) == sizeof(void *) );
+C_ASSERT( offsetof(struct macdrv_win_data, client_view) == 3 * sizeof(void *) );
+
+static void d3dmetal_init_display_devices(BOOL force)
+{
+}
+
+static struct macdrv_win_data *d3dmetal_get_win_data(HWND hwnd)
+{
+    struct macdrv_client_surface *surface;
+    struct client_surface **surfaces;
+    struct macdrv_win_data *data;
+
+    /* before the window data is taken: creating the surface takes it itself */
+    surface = macdrv_client_surface_create(hwnd);
+
+    if (!(data = get_win_data(hwnd)))
+    {
+        if (surface) client_surface_release(&surface->client);
+        return NULL;
+    }
+    if (!surface) return data;
+
+    if ((surfaces = realloc(data->d3dmetal_surfaces, (data->d3dmetal_surface_count + 1) * sizeof(*surfaces))))
+    {
+        data->d3dmetal_surfaces = surfaces;
+        surfaces[data->d3dmetal_surface_count++] = &surface->client;
+    }
+    else ERR("failed to keep the client surface of %p, it is leaked\n", hwnd);
+    return data;
+}
+
+struct macdrv_functions_t
+{
+    void (*macdrv_init_display_devices)(BOOL);
+    struct macdrv_win_data *(*get_win_data)(HWND hwnd);
+    void (*release_win_data)(struct macdrv_win_data *data);
+    macdrv_window (*macdrv_get_cocoa_window)(HWND hwnd, BOOL require_on_screen);
+    macdrv_metal_device (*macdrv_create_metal_device)(void);
+    void (*macdrv_release_metal_device)(macdrv_metal_device d);
+    macdrv_metal_view (*macdrv_view_create_metal_view)(macdrv_view v, macdrv_metal_device d);
+    macdrv_metal_layer (*macdrv_view_get_metal_layer)(macdrv_metal_view v);
+    void (*macdrv_view_release_metal_view)(macdrv_metal_view v);
+    void *on_main_thread;  /* DXMT does not read it */
+};
+
+__attribute__((visibility("default"))) struct macdrv_functions_t macdrv_functions =
+{
+    d3dmetal_init_display_devices,
+    d3dmetal_get_win_data,
+    release_win_data,
+    macdrv_get_cocoa_window,
+    macdrv_create_metal_device,
+    macdrv_release_metal_device,
+    macdrv_view_create_metal_view,
+    macdrv_view_get_metal_layer,
+    macdrv_view_release_metal_view,
+    NULL,
+};
+
+#endif
+
 /**********************************************************************
  *              SetDesktopWindow   (MACDRV.@)
  */
@@ -1239,6 +1314,10 @@ LRESULT macdrv_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 void macdrv_DestroyWindow(HWND hwnd)
 {
     struct macdrv_win_data *data;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct client_surface **surfaces;
+    unsigned int i, count;
+#endif
 
     TRACE("%p\n", hwnd);
 
@@ -1249,9 +1328,20 @@ void macdrv_DestroyWindow(HWND hwnd)
 
     destroy_cocoa_window(data);
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    surfaces = data->d3dmetal_surfaces;
+    count = data->d3dmetal_surface_count;
+#endif
     CFDictionaryRemoveValue(win_datas, hwnd);
     release_win_data(data);
     free(data);
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* Only now that the window data is released: releasing a surface takes win32u's surface lock
+     * and then, to detach, the window data, and the other holders of that lock take the two in
+     * this order as well. The detach finds no window data any more, which it handles. */
+    for (i = 0; i < count; i++) client_surface_release(surfaces[i]);
+    free(surfaces);
+#endif
 }
 
 
