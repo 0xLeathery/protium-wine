@@ -1552,6 +1552,27 @@ static const char *get_prot_str( BYTE prot )
  * protection byte has no bit left for this. Protected by virtual_mutex. */
 static BYTE **pages_wx_exec;
 
+/* A view allocated with MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT is backed by MAP_JIT memory: mapped
+ * RWX, but writable or executable per thread (pthread_jit_write_protect_np()). Its owner, an x86
+ * emulator's JIT, switches write access itself around its code writes, so its code never takes
+ * the two faults of a page flip. In such a view the byte of a host page in pages_wx_exec says
+ * whether the page is MAP_JIT-backed, and pages are not flipped. Write exceptions don't apply to
+ * these views: write-protecting a page would replace the MAP_JIT memory that the owner's write
+ * windows rely on. */
+#ifndef MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT
+#define MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT 0x80000000
+#endif
+#define VPROT_JIT     0x2000  /* view backed by MAP_JIT memory */
+#define WX_PAGE_EXEC  1       /* in pages_wx_exec: exec+write page that is mapped executable */
+#define WX_PAGE_JIT   2       /* in pages_wx_exec: page of a JIT view that is MAP_JIT-backed */
+
+static BOOL jit_views_used;  /* whether a view was ever backed by MAP_JIT memory */
+
+static inline BOOL is_jit_view( const struct file_view *view )
+{
+    return (view->protect & VPROT_JIT) != 0;
+}
+
 /* whether the host prot of a page (or the union of a host page's pages) would be writable and executable */
 static inline BOOL is_wx_page( BYTE vprot )
 {
@@ -1608,12 +1629,30 @@ static void clear_wx_exec( const void *addr, size_t size )
     }
 }
 
+/* whether the host page at addr, in a JIT view, is MAP_JIT-backed */
+static BOOL is_jit_page( const void *addr )
+{
+    BYTE *ptr = get_wx_exec_ptr( addr, FALSE );
+
+    return ptr && (*ptr & WX_PAGE_JIT);
+}
+
+/* record whether the host pages of a range, in a JIT view, are MAP_JIT-backed */
+static void set_jit_pages( const void *addr, size_t size, BOOL jit )
+{
+    const char *ptr = ROUND_ADDR( addr, host_page_mask ), *end = (const char *)addr + size;
+    BYTE *state;
+
+    for ( ; ptr < end; ptr += host_page_size)
+        if ((state = get_wx_exec_ptr( ptr, jit ))) *state = jit ? WX_PAGE_JIT : 0;
+}
+
 /* whether the exec+write host page at addr is mapped executable */
 static BOOL is_wx_exec( const void *addr, BYTE vprot )
 {
     BYTE *ptr;
 
-    return is_wx_page( vprot ) && (ptr = get_wx_exec_ptr( addr, FALSE )) && *ptr;
+    return is_wx_page( vprot ) && (ptr = get_wx_exec_ptr( addr, FALSE )) && (*ptr & WX_PAGE_EXEC);
 }
 
 /* the host prot of the host page at addr, from the get_unix_prot() of its pages' vprot union */
@@ -2163,6 +2202,158 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 }
 
 
+#ifdef WX_EXCLUSIVE_HOST
+/* mprotect() fails on MAP_JIT memory. So the host pages of a JIT view whose protection stops
+ * being exec+write are replaced with ordinary mappings, and pages that become exec+write again
+ * are replaced with MAP_JIT memory. */
+
+/* whether addr is in a JIT view; virtual_mutex must be held by caller */
+static BOOL is_jit_view_addr( const void *addr )
+{
+    struct file_view *view;
+
+    return jit_views_used && (view = find_view( addr, 0 )) && is_jit_view( view );
+}
+
+static BOOL is_host_page_readable( const void *addr )
+{
+    mach_vm_address_t region = (mach_vm_address_t)addr;
+    mach_vm_size_t size;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object;
+
+    if (mach_vm_region( mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+                        (vm_region_info_t)&info, &count, &object )) return FALSE;
+    return region <= (mach_vm_address_t)addr && (info.protection & VM_PROT_READ);
+}
+
+/* save the contents of a host page range that is about to be replaced, zero-filling unmapped
+ * pages; mapped pages that aren't readable (guard pages) are made readable first */
+static void *save_host_pages( char *base, size_t size )
+{
+    char *save = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
+    size_t i;
+
+    if (save == MAP_FAILED) return NULL;
+    for (i = 0; i < size; i += host_page_size)
+        if (is_host_page_readable( base + i ) || !mprotect( base + i, host_page_size, PROT_READ ))
+            memcpy( save + i, base + i, host_page_size );
+    return save;
+}
+
+/* replace a host page range with MAP_JIT memory; virtual_mutex must be held by caller */
+static BOOL map_jit_pages( char *base, size_t size, BOOL preserve )
+{
+    mach_vm_address_t addr = (mach_vm_address_t)base;
+    char *save = NULL;
+    void *ptr;
+
+    if (preserve && !(save = save_host_pages( base, size ))) return FALSE;
+    /* until the range is mapped again, a thread touching it takes a spurious access violation;
+     * that needs a protection change on code that is running */
+    munmap( base, size );
+    /* MAP_JIT can't be combined with MAP_FIXED, and XNU refuses to remap MAP_JIT memory over
+     * another range, but a hint into the hole we just made is honored */
+    ptr = mmap( base, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0 );
+    if (ptr != base)
+    {
+        if (ptr != MAP_FAILED) munmap( ptr, size );
+        WARN( "failed to map %p-%p as MAP_JIT\n", base, base + size );
+        /* another thread may have mapped into the hole; never overwrite its mapping */
+        if (mach_vm_allocate( mach_task_self(), &addr, size, VM_FLAGS_FIXED ))
+        {
+            ERR( "%p-%p was taken by another mapping, can't restore it\n", base, base + size );
+            abort();
+        }
+        if (save) memcpy( base, save, size );
+    }
+    else if (save)
+    {
+        pthread_jit_write_protect_np( 0 );
+        memcpy( base, save, size );
+        pthread_jit_write_protect_np( 1 );
+        sys_icache_invalidate( base, size );
+    }
+    if (save) munmap( save, size );
+    return ptr == base;
+}
+
+/* replace a MAP_JIT host page range with an ordinary mapping; virtual_mutex must be held by caller */
+static BOOL unmap_jit_pages( char *base, size_t size, int unix_prot, BOOL preserve )
+{
+    mach_vm_address_t addr = (mach_vm_address_t)base;
+    vm_prot_t cur_prot, max_prot;
+    kern_return_t kr;
+    char *copy;
+
+    if (!preserve) return anon_mmap_fixed( base, size, unix_prot, 0 ) != MAP_FAILED;
+
+    /* build the replacement elsewhere and swap it in, so the range never goes empty or zeroed */
+    if ((copy = anon_mmap_alloc( size, PROT_READ | PROT_WRITE )) == MAP_FAILED) return FALSE;
+    memcpy( copy, base, size );
+    if (unix_prot & PROT_EXEC) sys_icache_invalidate( copy, size );
+    if (mprotect( copy, size, unix_prot ))
+    {
+        munmap( copy, size );
+        return FALSE;
+    }
+    kr = mach_vm_remap( mach_task_self(), &addr, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                        mach_task_self(), (mach_vm_address_t)copy, FALSE, &cur_prot, &max_prot,
+                        VM_INHERIT_COPY );
+    munmap( copy, size );
+    return !kr;
+}
+
+/* mprotect_range() for a JIT view */
+static int mprotect_jit_range( char *addr, size_t size, BYTE set, BYTE clear )
+{
+    char *start, *end = addr + size;
+    BYTE vprot, run_vprot;
+    BOOL want, is_jit;
+    int prot, ret = 0;
+
+    while (addr < end)
+    {
+        run_vprot = (get_host_page_vprot( addr ) & ~clear) | set;
+        want = is_wx_page( run_vprot );
+        is_jit = is_jit_page( addr );
+        prot = get_unix_prot( run_vprot );
+
+        for (start = addr, addr += host_page_size; addr < end; addr += host_page_size)
+        {
+            vprot = (get_host_page_vprot( addr ) & ~clear) | set;
+            if (is_wx_page( vprot ) != want || is_jit_page( addr ) != is_jit) break;
+            if (!want && get_unix_prot( vprot ) != prot) break;
+        }
+
+        if (want && !is_jit)
+        {
+            if (map_jit_pages( start, addr - start, TRUE )) set_jit_pages( start, addr - start, TRUE );
+            else
+            {
+                ERR( "%p-%p lost its MAP_JIT backing\n", start, addr );
+                ret |= mprotect_exec( start, addr - start, prot );
+            }
+        }
+        else if (!want && is_jit)
+        {
+            if (unmap_jit_pages( start, addr - start, prot, (run_vprot & VPROT_COMMITTED) != 0 ))
+                set_jit_pages( start, addr - start, FALSE );
+            else
+            {
+                /* the pages stay MAP_JIT-backed, which their state keeps recording */
+                ERR( "failed to replace the MAP_JIT memory at %p-%p\n", start, addr );
+                ret = -1;
+            }
+        }
+        else if (!want) ret |= mprotect_exec( start, addr - start, prot );
+    }
+    return ret;
+}
+#endif
+
+
 /***********************************************************************
  *           mprotect_range
  *
@@ -2176,6 +2367,10 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
     BYTE vprot;
 
     size = ROUND_SIZE( base, size, host_page_mask );
+
+#ifdef WX_EXCLUSIVE_HOST
+    if (is_jit_view_addr( addr )) return mprotect_jit_range( addr, size, set, clear );
+#endif
 
     vprot = get_host_page_vprot( addr );
     prot = get_unix_prot( (vprot & ~clear) | set );
@@ -2215,10 +2410,15 @@ static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vpr
     {
         if (enable_write_exceptions && is_vprot_exec_write( vprot )) vprot |= VPROT_WRITEWATCH;
         else if (use_kernel_writewatch && view->protect & VPROT_WRITEWATCH) vprot &= ~VPROT_WRITEWATCH;
+#ifdef WX_EXCLUSIVE_HOST
+        /* the emulator that owns a JIT view writes it through its own MAP_JIT write windows */
+        if (is_jit_view( view )) vprot &= ~VPROT_WRITEWATCH;
+#endif
         set_page_vprot( base, size, vprot );
     }
 #ifdef WX_EXCLUSIVE_HOST
-    clear_wx_exec( base, size );
+    /* in a JIT view the state is the MAP_JIT backing, which mprotect_range() updates */
+    if (!is_jit_view( view )) clear_wx_exec( base, size );
 #endif
     return !mprotect_range( base, size, 0, 0 );
 }
@@ -2853,6 +3053,10 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
     else host_end = ROUND_ADDR( base + size, host_page_mask );
 
     if (host_start < host_end) anon_mmap_fixed( host_start, host_end - host_start, PROT_NONE, 0 );
+#ifdef WX_EXCLUSIVE_HOST
+    /* the replaced host pages are no longer MAP_JIT-backed */
+    if (is_jit_view( view ) && host_start < host_end) set_jit_pages( host_start, host_end - host_start, FALSE );
+#endif
     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
     return STATUS_SUCCESS;
@@ -5063,6 +5267,21 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
 
 #ifdef WX_EXCLUSIVE_HOST
     if (is_wx_page( vprot ) && (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT) &&
+        is_jit_view_addr( page ))
+    {
+        /* The owner switches write access itself, and flipping can't help: the thread's state
+         * comes back with the return from the signal. The access violation alone doesn't tell
+         * what happened, so say it. */
+        if (!is_jit_page( page ))
+            MESSAGE( "wine: %s fault at %p in JIT memory that lost its MAP_JIT backing\n",
+                     err == EXCEPTION_WRITE_FAULT ? "write" : "execute", addr );
+        else
+            MESSAGE( "wine: %s fault at %p in MAP_JIT memory, %s\n",
+                     err == EXCEPTION_WRITE_FAULT ? "write" : "execute", addr,
+                     err == EXCEPTION_WRITE_FAULT ? "written outside a JIT write window"
+                                                  : "executed inside a JIT write window" );
+    }
+    else if (is_wx_page( vprot ) && (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT) &&
         is_wx_access_allowed( get_page_vprot( addr ), err == EXCEPTION_EXECUTE_FAULT ))
     {
         BOOL exec = (err == EXCEPTION_EXECUTE_FAULT);
@@ -5473,7 +5692,8 @@ BOOL virtual_wx_begin_displaced_store( const void *pc, const void *addr )
 
     if (ROUND_ADDR( pc, host_page_mask ) != page) return FALSE;
     mutex_lock( &virtual_mutex );
-    if (is_wx_page( get_host_page_vprot( page )) && is_wx_access_allowed( get_page_vprot( addr ), FALSE ) &&
+    if (!is_jit_view_addr( page ) &&
+        is_wx_page( get_host_page_vprot( page )) && is_wx_access_allowed( get_page_vprot( addr ), FALSE ) &&
         set_wx_exec( page, FALSE ) && !mprotect_range( page, host_page_size, 0, 0 ))
         return TRUE;
     mutex_unlock( &virtual_mutex );
@@ -5561,6 +5781,9 @@ void virtual_enable_write_exceptions( BOOL enable )
     if (!enable_write_exceptions && enable)  /* change all existing views */
     {
         WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+#ifdef WX_EXCLUSIVE_HOST
+            if (is_jit_view( view )) continue; else
+#endif
             if (set_page_vprot_exec_write_protect( view->base, view->size ))
                 mprotect_range( view->base, view->size, 0, 0 );
     }
@@ -5721,6 +5944,13 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
     if (type & MEM_RESERVE_PLACEHOLDER && (protect != PAGE_NOACCESS)) return STATUS_INVALID_PARAMETER;
     if (!arm64ec_view && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE)) return STATUS_INVALID_PARAMETER;
+#ifdef WX_EXCLUSIVE_HOST
+    if ((attributes & MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT) &&
+        ((type & (MEM_RESERVE | MEM_COMMIT)) != (MEM_RESERVE | MEM_COMMIT) ||
+         (type & (MEM_WRITE_WATCH | MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER)) ||
+         protect != PAGE_EXECUTE_READWRITE || is_dos_memory))
+        return STATUS_INVALID_PARAMETER;
+#endif
 
     /* Reserve the memory */
 
@@ -5743,6 +5973,15 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
             if (status == STATUS_SUCCESS)
             {
                 base = view->base;
+#ifdef WX_EXCLUSIVE_HOST
+                if ((attributes & MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT) &&
+                    map_jit_pages( base, ROUND_SIZE( 0, view->size, host_page_mask ), FALSE ))
+                {
+                    view->protect |= VPROT_JIT;
+                    jit_views_used = TRUE;
+                    set_jit_pages( base, view->size, TRUE );
+                }
+#endif
                 if (vprot & VPROT_EXEC || force_exec_prot) mprotect_range( base, size, 0, 0 );
             }
         }
@@ -7631,6 +7870,9 @@ static NTSTATUS set_dirty_state_information( ULONG_PTR count, MEMORY_RANGE_ENTRY
             ret = STATUS_MEMORY_NOT_ALLOCATED;
             break;
         }
+#ifdef WX_EXCLUSIVE_HOST
+        if (is_jit_view( view )) continue;
+#endif
         if (use_kernel_writewatch) reset_write_watches( base, size );
         else if (set_page_vprot_exec_write_protect( base, size ))
             mprotect_range( base, size, 0, 0 );
