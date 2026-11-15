@@ -509,6 +509,21 @@ static void init_paths(void)
         bin_dir = build_relative_path( dll_dir, LIBDIR "/wine", BINDIR );
         data_dir = build_relative_path( dll_dir, LIBDIR "/wine", DATADIR "/wine" );
         wineloader = build_path( ntdll_dir, "wine" );
+#if defined(__APPLE__) && defined(__aarch64__)
+        {
+            /* Start processes through the loader inside wine.app when the installation has
+             * one, not through the link to it next to ntdll.so: a process only has the identity
+             * of a bundle when the path it was started with is inside that bundle. */
+            char *bundle_loader = build_path( ntdll_dir, "wine.app/Contents/MacOS/wine" );
+
+            if (!access( bundle_loader, X_OK ))
+            {
+                free( (char *)wineloader );
+                wineloader = bundle_loader;
+            }
+            else free( bundle_loader );
+        }
+#endif
     }
 
     set_dll_path();
