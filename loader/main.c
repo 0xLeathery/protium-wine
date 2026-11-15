@@ -168,6 +168,15 @@ static void *try_dlopen( const char *argv0 )
 
     if ((p = remove_tail( dir, "/loader" )))
         path = build_path( p, "dlls/ntdll/ntdll.so" );
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* the loader can run from an app bundle next to ntdll.so, e.g. wine.app/Contents/MacOS/wine,
+     * so that it can carry entitlements granted by a provisioning profile */
+    else if ((p = remove_tail( dir, ".app/Contents/MacOS" )) && strrchr( p, '/' ))
+    {
+        *strrchr( p, '/' ) = 0;
+        path = build_path( p, "ntdll.so" );
+    }
+#endif
     else
         path = build_path( dir, "ntdll.so" );
 
