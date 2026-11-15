@@ -523,6 +523,18 @@ static void init_paths(void)
             }
             else free( bundle_loader );
         }
+        if (!getenv( "VK_DRIVER_FILES" ) && !getenv( "VK_ICD_FILENAMES" ) && !getenv( "VK_ADD_DRIVER_FILES" ))
+        {
+            /* Point the Vulkan loader at the drivers the installation carries, unless the
+             * caller names its own. With VK_DRIVER_FILES set the loader searches nowhere
+             * else (and ignores VK_ADD_DRIVER_FILES), so a driver that happens to be
+             * installed on the Mac is not offered to Windows code as well. */
+            char *icd_dir = build_relative_path( dll_dir, LIBDIR "/wine", DATADIR "/vulkan/icd.d" );
+            struct stat st;
+
+            if (!stat( icd_dir, &st ) && S_ISDIR( st.st_mode )) setenv( "VK_DRIVER_FILES", icd_dir, 1 );
+            free( icd_dir );
+        }
 #endif
     }
 
