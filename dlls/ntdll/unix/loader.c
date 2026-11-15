@@ -1928,6 +1928,30 @@ static NTSTATUS open_main_image( UNICODE_STRING *nt_name, void **module, SECTION
 }
 
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/***********************************************************************
+ *           check_main_exe_memory
+ *
+ * A 32-bit program lives below 4GB, and without the cross-architecture entitlement macOS maps
+ * nothing there. The parameters of such a process cannot be allocated, and it would end on the
+ * assertion in build_wow64_parameters(), with a crash report for every 32-bit program that
+ * something tries to start, such as the 32-bit rundll32 of a new prefix. Ask for what that
+ * allocation asks for, and say what is missing.
+ */
+static void check_main_exe_memory(void)
+{
+    void *ptr = NULL;
+    SIZE_T size = 0x10000;
+
+    if (is_machine_64bit( main_image_info.Machine )) return;
+    if (NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, limit_2g - 1, &size, MEM_RESERVE, PAGE_NOACCESS ))
+        fatal_error( "a 32-bit program needs memory below 4GB, which macOS only gives to a loader "
+                     "with the cross-architecture entitlement\n" );
+    size = 0;
+    NtFreeVirtualMemory( NtCurrentProcess(), &ptr, &size, MEM_RELEASE );
+}
+#endif
+
 /***********************************************************************
  *           load_main_exe
  */
@@ -1939,12 +1963,18 @@ NTSTATUS load_main_exe( UNICODE_STRING *nt_name, USHORT load_machine, void **mod
     USHORT search_machine;
 
     status = open_main_image( nt_name, module, &main_image_info, loadorder, load_machine );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (NT_SUCCESS(status)) check_main_exe_memory();
+#endif
     if (status != STATUS_DLL_NOT_FOUND) return status;
 
     /* if path is in system dir, we can load the builtin even if the file itself doesn't exist */
     if (loadorder != LO_NATIVE && is_builtin_path( nt_name, &search_machine ))
         status = find_builtin_dll( nt_name, NULL, module, &size, &main_image_info, 0, 0,
                                    search_machine, load_machine, FALSE, 0 );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (NT_SUCCESS(status)) check_main_exe_memory();
+#endif
     return status;
 }
 
