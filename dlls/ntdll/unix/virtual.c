@@ -6115,8 +6115,17 @@ static NTSTATUS get_extended_params( const MEM_EXTENDED_PARAMETER *parameters, U
             MEM_ADDRESS_REQUIREMENTS *r = parameters[i].Pointer;
             ULONG_PTR limit;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+            /* In a wow64 process this is called by 64-bit code only: wow64.dll bounds what
+             * 32-bit code asks for before it gets here. The 64-bit code of such a process is
+             * its emulator, and FEX asks for all of its own memory above the 32-bit address
+             * space, to keep out of what the program can see. Refused, its allocator starts
+             * with a null pointer and no 32-bit program runs. */
+            limit = (ULONG_PTR)user_space_limit;
+#else
             if (is_wow64()) limit = get_wow_user_space_limit();
             else limit = (ULONG_PTR)user_space_limit;
+#endif
 
             if (r->Alignment)
             {
