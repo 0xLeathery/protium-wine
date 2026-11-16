@@ -194,6 +194,13 @@ case "$host_os-$HOST_ARCH" in
   darwin*-aarch64) wine_user_shared_data_cflags="-DWINE_USER_SHARED_DATA_ADDR=0x7ffe00000000" ;;
 esac
 
+dnl PE code has no __APPLE__ to tell the native arm64 macOS build by, so it gets this define, in
+dnl every PE architecture, for the changes made for that build
+wine_macos_aarch64_cflags=""
+case "$host_os-$HOST_ARCH" in
+  darwin*-aarch64) wine_macos_aarch64_cflags="-DWINE_MACOS_AARCH64" ;;
+esac
+
 m4_set_add_all([_AC_SUBST_VARS],[HOST_ARCH]m4_foreach([cpu],[aarch64,arm,arm64ec,i386,x86_64],
                                 [m4_foreach([var],[CC,CFLAGS,EXTRACFLAGS,CXXFLAGS,LDFLAGS,DEBUG,TARGET,STRIP,DELAYLOADFLAG,DISABLED_SUBDIRS],[,cpu[_]var])]))
 
@@ -452,6 +459,10 @@ do
     AS_VAR_COPY([CFLAGS],[${wine_arch}_CFLAGS])
     AS_VAR_COPY([LDFLAGS],[${wine_arch}_LDFLAGS])
     AS_VAR_SET([${wine_arch}_EXTRACFLAGS],["-D__WINE_PE_BUILD -Wall"])
+    if test -n "$wine_macos_aarch64_cflags"
+    then
+        AS_VAR_APPEND([${wine_arch}_EXTRACFLAGS],[" $wine_macos_aarch64_cflags"])
+    fi
     dnl 32-bit PE code can't address KUSER_SHARED_DATA above 4 GB, so only 64-bit PE code gets the define
     case $wine_arch in
       i386|arm) ;;
