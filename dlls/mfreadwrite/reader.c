@@ -881,6 +881,12 @@ static HRESULT source_reader_pull_transform_samples(struct source_reader *reader
                 hr = source_reader_push_transform_samples(reader, stream, next, out_buffer.pSample);
             else
                 hr = source_reader_queue_sample(reader, stream, entry->pending_flags, out_buffer.pSample);
+#ifdef WINE_MACOS_AARCH64
+            /* The next transform asking for more input says nothing about this one, which can hold
+             * more output: a decoder with frame threads holds a frame per thread, and stopping here
+             * at a drain lost all of them. */
+            if (next && hr == MF_E_TRANSFORM_NEED_MORE_INPUT) hr = S_OK;
+#endif
 
             entry->pending_flags = 0;
         }
