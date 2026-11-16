@@ -1681,6 +1681,10 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
     struct macdrv_win_data *data;
     unsigned int new_style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     struct window_rects old_rects;
+#if defined(__APPLE__) && defined(__aarch64__)
+    struct client_surface **d3dmetal_surfaces = NULL;
+    unsigned int d3dmetal_count = 0, i;
+#endif
 
     if (!(data = get_win_data(hwnd))) return;
 
@@ -1733,7 +1737,24 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
     }
 
 done:
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* win32u updates the client surfaces on its own list when a window moves or is resized, and
+     * the ones made for DXMT are not on it (see macdrv_functions): without this their views keep
+     * the size they were made with. No reference is taken here, which would take win32u's lock
+     * after the window data's; the surfaces are released only when the window is destroyed,
+     * which is done on this thread too. The update takes the window data itself. */
+    if (data->d3dmetal_surface_count &&
+        (d3dmetal_surfaces = malloc(data->d3dmetal_surface_count * sizeof(*d3dmetal_surfaces))))
+    {
+        d3dmetal_count = data->d3dmetal_surface_count;
+        memcpy(d3dmetal_surfaces, data->d3dmetal_surfaces, d3dmetal_count * sizeof(*d3dmetal_surfaces));
+    }
+#endif
     release_win_data(data);
+#if defined(__APPLE__) && defined(__aarch64__)
+    for (i = 0; i < d3dmetal_count; i++) macdrv_client_surface_update(d3dmetal_surfaces[i]);
+    free(d3dmetal_surfaces);
+#endif
 }
 
 
