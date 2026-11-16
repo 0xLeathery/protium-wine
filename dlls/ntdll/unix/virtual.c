@@ -340,6 +340,12 @@ static BOOL increase_try_map_step = TRUE;
 
 ULONG_PTR user_space_wow_limit = 0;
 struct _KUSER_SHARED_DATA *user_shared_data = (void *)WINE_USER_SHARED_DATA_ADDR;
+#if defined(__APPLE__) && defined(__aarch64__)
+/* A second mapping of the page at its Windows address, 0x7ffe0000, when the low 4 GB can be
+ * mapped. Programs read it there without asking anyone, and so does Wine's 32-bit code, which
+ * cannot address the relocated page that Wine's 64-bit code is built for. */
+static void *user_shared_data_low;
+#endif
 
 /* TEB allocation blocks */
 static void *teb_block;
@@ -4662,6 +4668,19 @@ TEB *virtual_alloc_first_teb(void)
     }
 
 #if defined(__APPLE__) && defined(__aarch64__)
+    /* before the TEBs, which would otherwise be allocated over it */
+    if (mmap_is_in_reserved_area( (void *)0x7ffe0000, page_size ) == 1)
+    {
+        void *low = (void *)0x7ffe0000;
+
+        data_size = page_size;
+        if (!NtAllocateVirtualMemory( NtCurrentProcess(), &low, 0, &data_size,
+                                      MEM_RESERVE | MEM_COMMIT, PAGE_READONLY ))
+            user_shared_data_low = low;
+    }
+#endif
+
+#if defined(__APPLE__) && defined(__aarch64__)
     /* Below 2 GB, where the 32-bit code of a wow64 process can address its TEB, when the loader
      * could reserve the low 4 GB, which takes the cross-architecture entitlement. Without it
      * nothing can be mapped there, and the TEBs go anywhere: there is no wow64 then. */
@@ -5126,6 +5145,11 @@ void virtual_map_user_shared_data(void)
         ERR( "failed to remap the process USD: %d\n", res );
         exit(1);
     }
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (user_shared_data_low &&
+        user_shared_data_low != mmap( user_shared_data_low, page_size, PROT_READ, MAP_SHARED|MAP_FIXED, fd, 0 ))
+        ERR( "failed to map the USD at its Windows address\n" );
+#endif
     if (needs_close) close( fd );
     NtClose( section );
 }
