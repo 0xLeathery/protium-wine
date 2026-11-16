@@ -29,6 +29,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <pthread.h>  /* for pthread_mutex_t, which no other header here brings in on macOS */
+#endif
 
 #include "unix_private.h"
 #include "wine/rbtree.h"
