@@ -535,6 +535,22 @@ static void init_paths(void)
             if (!stat( icd_dir, &st ) && S_ISDIR( st.st_mode )) setenv( "VK_DRIVER_FILES", icd_dir, 1 );
             free( icd_dir );
         }
+        if (!getenv( "GST_PLUGIN_SYSTEM_PATH_1_0" ) && !getenv( "GST_PLUGIN_SYSTEM_PATH" ))
+        {
+            /* The same for winegstreamer: the GStreamer plugins and plugin scanner that the
+             * installation carries in lib/external, and no others, such as Homebrew's. */
+            char *plugin_dir = build_relative_path( dll_dir, LIBDIR "/wine", LIBDIR "/external/gstreamer-1.0" );
+            char *scanner = build_relative_path( dll_dir, LIBDIR "/wine", LIBDIR "/external/gst-plugin-scanner" );
+            struct stat st;
+
+            if (!stat( plugin_dir, &st ) && S_ISDIR( st.st_mode ))
+            {
+                setenv( "GST_PLUGIN_SYSTEM_PATH_1_0", plugin_dir, 1 );
+                if (!access( scanner, X_OK ) && !getenv( "GST_PLUGIN_SCANNER_1_0" )) setenv( "GST_PLUGIN_SCANNER_1_0", scanner, 1 );
+            }
+            free( plugin_dir );
+            free( scanner );
+        }
 #endif
     }
 
