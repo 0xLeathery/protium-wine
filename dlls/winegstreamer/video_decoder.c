@@ -28,6 +28,9 @@
 #include "wmcodecdsp.h"
 
 #include "wine/debug.h"
+#ifdef WINE_MACOS_AARCH64
+#include "d3d11.h"
+#endif
 
 #include "initguid.h"
 
@@ -108,6 +111,9 @@ struct video_decoder
 
     IMFVideoSampleAllocatorEx *allocator;
     BOOL allocator_initialized;
+#ifdef WINE_MACOS_AARCH64
+    IUnknown *device_manager;
+#endif
     IMFTransform *copier;
     IMFMediaBuffer *temp_buffer;
 
@@ -170,6 +176,10 @@ static ULONG WINAPI unknown_Release(IUnknown *iface)
     {
         IMFTransform_Release(decoder->copier);
         IMFVideoSampleAllocatorEx_Release(decoder->allocator);
+#ifdef WINE_MACOS_AARCH64
+        if (decoder->device_manager)
+            IUnknown_Release(decoder->device_manager);
+#endif
         if (decoder->temp_buffer)
             IMFMediaBuffer_Release(decoder->temp_buffer);
         if (decoder->wg_transform)
@@ -446,6 +456,38 @@ done:
     return hr;
 }
 
+#ifdef WINE_MACOS_AARCH64
+/* Whether the Direct3D 11 device of a device manager can hold samples of a media type as textures.
+ * DXMT has no video formats (NV12, YUY2...), and the sample allocator then fails on every frame.
+ * A manager that is not a Direct3D 11 one is left to the allocator. */
+static BOOL device_manager_has_textures(IUnknown *manager, IMFMediaType *media_type)
+{
+    IMFDXGIDeviceManager *dxgi_manager;
+    ID3D11Device *device;
+    UINT support = 0;
+    BOOL ret = TRUE;
+    HANDLE handle;
+    GUID subtype;
+
+    if (FAILED(IMFMediaType_GetGUID(media_type, &MF_MT_SUBTYPE, &subtype)))
+        return TRUE;
+    if (FAILED(IUnknown_QueryInterface(manager, &IID_IMFDXGIDeviceManager, (void **)&dxgi_manager)))
+        return TRUE;
+    if (SUCCEEDED(IMFDXGIDeviceManager_OpenDeviceHandle(dxgi_manager, &handle)))
+    {
+        if (SUCCEEDED(IMFDXGIDeviceManager_GetVideoService(dxgi_manager, handle, &IID_ID3D11Device, (void **)&device)))
+        {
+            ret = SUCCEEDED(ID3D11Device_CheckFormatSupport(device, MFMapDX9FormatToDXGIFormat(subtype.Data1), &support))
+                    && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D);
+            ID3D11Device_Release(device);
+        }
+        IMFDXGIDeviceManager_CloseDeviceHandle(dxgi_manager, handle);
+    }
+    IMFDXGIDeviceManager_Release(dxgi_manager);
+    return ret;
+}
+
+#endif
 static HRESULT init_allocator(struct video_decoder *decoder)
 {
     HRESULT hr;
@@ -457,6 +499,13 @@ static HRESULT init_allocator(struct video_decoder *decoder)
         return hr;
     if (FAILED(hr = IMFTransform_SetOutputType(decoder->copier, 0, decoder->output_type, 0)))
         return hr;
+#ifdef WINE_MACOS_AARCH64
+    /* The allocator gets the device only when it can hold the output type as textures, which are
+     * the RGB types; for the others the samples are in system memory. */
+    if (decoder->device_manager && FAILED(hr = IMFVideoSampleAllocatorEx_SetDirectXManager(decoder->allocator,
+            device_manager_has_textures(decoder->device_manager, decoder->output_type) ? decoder->device_manager : NULL)))
+        return hr;
+#endif
 
     if (FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(decoder->allocator, 10, 10,
             decoder->attributes, decoder->output_type)))
@@ -851,6 +900,13 @@ static HRESULT WINAPI transform_ProcessMessage(IMFTransform *iface, MFT_MESSAGE_
     case MFT_MESSAGE_SET_D3D_MANAGER:
         if (FAILED(hr = IMFVideoSampleAllocatorEx_SetDirectXManager(decoder->allocator, (IUnknown *)param)))
             return hr;
+#ifdef WINE_MACOS_AARCH64
+        /* kept for init_allocator(), which knows the output type */
+        if (decoder->device_manager)
+            IUnknown_Release(decoder->device_manager);
+        if ((decoder->device_manager = (IUnknown *)param))
+            IUnknown_AddRef(decoder->device_manager);
+#endif
 
         uninit_allocator(decoder);
         if (param)
