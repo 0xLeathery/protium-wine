@@ -1365,6 +1365,15 @@ static NTSTATUS steamclient_setup_trampolines( void *args )
     char *name, *wsne;
     UINT_PTR page_mask;
     int i;
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* A page here is never writable and executable at once, so the code is made writable
+     * while the jumps are written and executable again afterwards, through the same calls as
+     * any other protection change so that the view's protection stays what the host has. */
+    void *text_addr[8];
+    SIZE_T text_size[8];
+    ULONG text_old[8];
+    int text_count = 0;
+#endif
 
     if (noexec_cached == -1)
         noexec_cached = (wsne = getenv("WINESTEAMNOEXEC")) && atoi(wsne);
@@ -1378,7 +1387,18 @@ static NTSTATUS steamclient_setup_trampolines( void *args )
         addr = (void *)(((UINT_PTR)src_mod + src_sec[i].VirtualAddress) & ~page_mask);
         size = (src_sec[i].Misc.VirtualSize + page_mask) & ~page_mask;
         if (noexec_cached) mprotect(addr, size, PROT_READ);
+#if defined(__APPLE__) && defined(__aarch64__)
+        else if (text_count < ARRAY_SIZE(text_addr))
+        {
+            text_addr[text_count] = addr;
+            text_size[text_count] = size;
+            if (!NtProtectVirtualMemory( NtCurrentProcess(), &text_addr[text_count], &text_size[text_count],
+                                         PAGE_READWRITE, &text_old[text_count] ))
+                text_count++;
+        }
+#else
         else mprotect(addr, size, PROT_READ|PROT_WRITE|PROT_EXEC);
+#endif
     }
 
     src_exp = get_module_data_dir( src_mod, IMAGE_FILE_EXPORT_DIRECTORY, NULL );
@@ -1423,6 +1443,10 @@ static NTSTATUS steamclient_setup_trampolines( void *args )
     }
     else steamclient_count++;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    for (i = 0; i < text_count; ++i)
+        NtProtectVirtualMemory( NtCurrentProcess(), &text_addr[i], &text_size[i], text_old[i], &text_old[i] );
+#endif
     return STATUS_SUCCESS;
 }
 
