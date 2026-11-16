@@ -1071,8 +1071,8 @@ static void open_builtin_unix_handle( void *module, const char *name, sigset_t *
     }
     dlclose( handle );
 }
-#endif
 
+#endif
 /***********************************************************************
  *           get_builtin_unix_funcs
  */
