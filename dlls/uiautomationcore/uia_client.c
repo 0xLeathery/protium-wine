@@ -178,6 +178,9 @@ static HWND get_hwnd_from_provider(IRawElementProviderSimple *elprov)
 
     hwnd = NULL;
     VariantInit(&v);
+#if defined(__APPLE__) && defined(__aarch64__)
+    host_prov = NULL;  /* see uia_provider_has_parent() */
+#endif
     hr = IRawElementProviderSimple_get_HostRawElementProvider(elprov, &host_prov);
     if (SUCCEEDED(hr) && host_prov)
     {
@@ -1788,6 +1791,13 @@ static HRESULT WINAPI uia_provider_has_parent(IWineUiaProvider *iface, BOOL *out
         hr = IRawElementProviderSimple_QueryInterface(prov->elprov, &IID_IRawElementProviderFragment, (void **)&elfrag);
         if (SUCCEEDED(hr) && elfrag)
         {
+#if defined(__APPLE__) && defined(__aarch64__)
+            /* A provider may return S_OK and leave the result alone when there is nothing to
+             * return: the one of AccessKit, which the Godot editor uses, does so for the
+             * parent of its root. What is released below was then whatever the stack held.
+             * In an x86_64 program that was the address of a function. */
+            elfrag2 = NULL;
+#endif
             hr = IRawElementProviderFragment_Navigate(elfrag, NavigateDirection_Parent, &elfrag2);
             IRawElementProviderFragment_Release(elfrag);
             if (SUCCEEDED(hr) && elfrag2)
@@ -1818,6 +1828,9 @@ static HRESULT WINAPI uia_provider_navigate(IWineUiaProvider *iface, int nav_dir
     if (FAILED(hr) || !elfrag)
         return S_OK;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    elfrag2 = NULL;  /* see uia_provider_has_parent() */
+#endif
     hr = IRawElementProviderFragment_Navigate(elfrag, nav_dir, &elfrag2);
     IRawElementProviderFragment_Release(elfrag);
     if (SUCCEEDED(hr) && elfrag2)
@@ -1855,6 +1868,9 @@ static HRESULT WINAPI uia_provider_get_focus(IWineUiaProvider *iface, LONG flags
     if (FAILED(hr))
         return S_OK;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    elfrag = NULL;  /* see uia_provider_has_parent() */
+#endif
     hr = IRawElementProviderFragmentRoot_GetFocus(elroot, &elfrag);
     IRawElementProviderFragmentRoot_Release(elroot);
     if (FAILED(hr) || !elfrag)
