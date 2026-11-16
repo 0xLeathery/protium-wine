@@ -193,9 +193,19 @@ static HRESULT video_processor_init_allocator(struct video_processor *processor)
         return hr;
     if (FAILED(IMFAttributes_GetUINT32(processor->attributes, &MF_SA_MINIMUM_OUTPUT_SAMPLE_COUNT, &count)))
         count = 2;
+#ifdef WINE_MACOS_AARCH64
+    /* At the end of a stream the source reader pulls every frame the decoder still holds through
+     * this allocator before the application takes any of them, up to one for each of the 16 decoding
+     * threads and 16 more kept back for reordering: leave room for those above the usual maximum.
+     * The extra samples are only made then. */
+    if (FAILED(hr = IMFVideoSampleAllocatorEx_SetDirectXManager(allocator, processor->device_manager))
+            || FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(allocator, count, max(count + 2, 10) + 32,
+            processor->output_attributes, processor->output_type)))
+#else
     if (FAILED(hr = IMFVideoSampleAllocatorEx_SetDirectXManager(allocator, processor->device_manager))
             || FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(allocator, count, max(count + 2, 10),
             processor->output_attributes, processor->output_type)))
+#endif
     {
         IMFVideoSampleAllocatorEx_Release(allocator);
         return hr;

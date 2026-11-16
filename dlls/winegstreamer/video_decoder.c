@@ -507,8 +507,17 @@ static HRESULT init_allocator(struct video_decoder *decoder)
         return hr;
 #endif
 
+#ifdef WINE_MACOS_AARCH64
+    /* At the end of a stream the source reader pulls every frame still held here at once, up to one
+     * for each of the 16 decoding threads and 16 more kept back for reordering, and a sample only
+     * comes back to the allocator some time after its release: leave room for those above the usual
+     * maximum. The extra samples are only made then. */
+    if (FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(decoder->allocator, 10, 10 + 32,
+            decoder->attributes, decoder->output_type)))
+#else
     if (FAILED(hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(decoder->allocator, 10, 10,
             decoder->attributes, decoder->output_type)))
+#endif
         return hr;
     decoder->allocator_initialized = TRUE;
     return S_OK;
