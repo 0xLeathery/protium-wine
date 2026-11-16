@@ -1030,6 +1030,49 @@ static void load_steam_overlay(const char *unix_lib_path)
     }
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/***********************************************************************
+ *           open_builtin_unix_handle
+ *
+ * Open the Unix library of a builtin with virtual_mutex released; it is held on entry and on
+ * return. A thread inside dlopen() holds dyld's lock and can be suspended there by another
+ * thread. The one that would resume it takes virtual_mutex before it reads a server reply, so
+ * nobody may wait for dyld's lock with virtual_mutex held.
+ */
+static void open_builtin_unix_handle( void *module, const char *name, sigset_t *sigset )
+{
+    struct builtin_module *builtin;
+    char *path = NULL;
+    void *handle;
+
+    LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+    {
+        if (builtin->module != module) continue;
+        if (builtin->unix_handle) return;
+        if (builtin->unix_path) name = builtin->unix_path;
+        if (name) path = strdup( name );
+        break;
+    }
+    if (!path) return;
+
+    server_leave_uninterrupted_section( &virtual_mutex, sigset );
+    load_steam_overlay( path );
+    handle = dlopen( path, RTLD_NOW );
+    server_enter_uninterrupted_section( &virtual_mutex, sigset );
+    free( path );
+    if (!handle) return;
+
+    LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+    {
+        if (builtin->module != module) continue;
+        if (builtin->unix_handle) break;
+        builtin->unix_handle = handle;
+        return;
+    }
+    dlclose( handle );
+}
+#endif
+
 /***********************************************************************
  *           get_builtin_unix_funcs
  */
@@ -1041,6 +1084,20 @@ static NTSTATUS get_builtin_unix_funcs( void *module, BOOL wow, const void **fun
     struct builtin_module *builtin;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    open_builtin_unix_handle( module, NULL, &sigset );
+    LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+    {
+        void *handle;
+
+        if (builtin->module != module) continue;
+        if (!(handle = builtin->unix_handle)) break;
+        /* dlsym() takes dyld's lock too */
+        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+        *funcs = dlsym( handle, ptr_name );
+        return *funcs ? STATUS_SUCCESS : STATUS_ENTRYPOINT_NOT_FOUND;
+    }
+#endif
     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
     {
         if (builtin->module != module) continue;
@@ -1073,6 +1130,9 @@ NTSTATUS load_builtin_unixlib( void *module, const char *name )
     struct builtin_module *builtin;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+#if defined(__APPLE__) && defined(__aarch64__)
+    open_builtin_unix_handle( module, name, &sigset );
+#endif
     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
     {
         if (builtin->module != module) continue;
