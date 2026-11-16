@@ -4268,7 +4268,11 @@ void virtual_init(void)
             mmap_add_reserved_area( (*preload_info)[i].addr, (*preload_info)[i].size );
 
 #if defined(__APPLE__) && defined(__aarch64__)
-    address_space_start = get_host_address_floor();
+    /* With the low 4 GB reserved by the loader, which takes the cross-architecture entitlement,
+     * the address space starts where it does on Windows, and 32-bit images, which have to
+     * be below 4 GB, find their place. Without it, it starts at the lowest host mapping. */
+    if (mmap_is_in_reserved_area( (void *)0x10000, 0x10000 ) == 1) address_space_start = (void *)0x10000;
+    else address_space_start = get_host_address_floor();
     TRACE( "address space start: %p\n", address_space_start );
 #endif
     mmap_init( preload_info ? *preload_info : NULL );
@@ -4658,9 +4662,12 @@ TEB *virtual_alloc_first_teb(void)
     }
 
 #if defined(__APPLE__) && defined(__aarch64__)
-    /* nothing can be mapped below 4 GB, so the TEBs can't be kept below 2 GB for wow64 */
-    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, 0, &total,
-                             MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+    /* Below 2 GB, where the 32-bit code of a wow64 process can address its TEB, when the loader
+     * could reserve the low 4 GB, which takes the cross-architecture entitlement. Without it
+     * nothing can be mapped there, and the TEBs go anywhere: there is no wow64 then. */
+    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block,
+                             mmap_is_in_reserved_area( (void *)0x10000000, 0x10000 ) == 1 ? limit_2g - 1 : 0,
+                             &total, MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
 #else
     NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 ? limit_2g - 1 : 0, &total,
                              MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
