@@ -204,6 +204,12 @@ static int macdrv_get_gpu_info_from_mtldevice(struct macdrv_gpu* gpu, id<MTLDevi
     int ret;
     if ((ret = macdrv_get_gpu_info_from_registry_id(gpu, [device registryID])))
         return ret;
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* The native arm64 build keeps an Apple GPU's device ID at 0, which is what its Direct3D
+     * gives: DXMT's DXGI, which Direct3D 10 to 12 go through, reports VEN_106B&DEV_0000, and a
+     * game that looks its DXGI adapter up among the display devices by that ID must find it. */
+    return 0;
+#endif
 #if defined(MAC_OS_X_VERSION_10_15) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_15
     /* Apple GPUs aren't PCI devices and therefore have no device ID
      * Use the Metal GPUFamily as the device ID */
