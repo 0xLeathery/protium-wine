@@ -750,6 +750,66 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
 }
 
 
+#ifdef __APPLE__
+static void dump_native_backtrace( ucontext_t *context, const char *what );
+
+/* The last exceptions raised in this process, with runs of the same one counted. A thread whose
+ * exception handling faults again and again ends with "stack overflow" and nothing else: these
+ * say which fault that was, and what came before it. They are written without a lock, from
+ * signal handlers, and may lose an entry to another thread; they are only ever printed. */
+static struct
+{
+    DWORD     tid, code;
+    ULONG_PTR addr, info[2];
+    unsigned int count;
+} recent_exceptions[16];
+static unsigned int recent_exceptions_pos;
+
+static void note_exception( const EXCEPTION_RECORD *rec )
+{
+    unsigned int pos = recent_exceptions_pos;
+    DWORD tid = HandleToULong( NtCurrentTeb()->ClientId.UniqueThread );
+    ULONG_PTR info0 = rec->NumberParameters > 0 ? rec->ExceptionInformation[0] : 0;
+    ULONG_PTR info1 = rec->NumberParameters > 1 ? rec->ExceptionInformation[1] : 0;
+    typeof(recent_exceptions[0]) *last = &recent_exceptions[(pos - 1) % ARRAY_SIZE(recent_exceptions)], *entry;
+
+    if (pos && last->tid == tid && last->code == rec->ExceptionCode && last->addr == (ULONG_PTR)rec->ExceptionAddress &&
+        last->info[0] == info0 && last->info[1] == info1)
+    {
+        last->count++;
+        return;
+    }
+    entry = &recent_exceptions[pos % ARRAY_SIZE(recent_exceptions)];
+    entry->tid = tid;
+    entry->code = rec->ExceptionCode;
+    entry->addr = (ULONG_PTR)rec->ExceptionAddress;
+    entry->info[0] = info0;
+    entry->info[1] = info1;
+    entry->count = 1;
+    recent_exceptions_pos = pos + 1;
+}
+
+static void dump_recent_exceptions(void)
+{
+    unsigned int i, pos = recent_exceptions_pos, first = pos > ARRAY_SIZE(recent_exceptions) ? pos - ARRAY_SIZE(recent_exceptions) : 0;
+    char buffer[256];
+    int len;
+
+    len = snprintf( buffer, sizeof(buffer), "wine: the exceptions raised before this, oldest first:\n" );
+    write( 2, buffer, len );
+    for (i = first; i < pos; i++)
+    {
+        typeof(recent_exceptions[0]) *entry = &recent_exceptions[i % ARRAY_SIZE(recent_exceptions)];
+
+        len = snprintf( buffer, sizeof(buffer), "wine:   thread %04x code %08x at 0x%lx info 0x%lx 0x%lx, %u time(s)\n",
+                        (unsigned int)entry->tid, (unsigned int)entry->code, (unsigned long)entry->addr,
+                        (unsigned long)entry->info[0], (unsigned long)entry->info[1], entry->count );
+        write( 2, buffer, min( len, (int)sizeof(buffer) - 1 ));
+    }
+}
+
+
+#endif
 /***********************************************************************
  *           setup_raise_exception
  */
@@ -758,6 +818,19 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     struct exc_stack_layout *stack;
     void *stack_ptr = (void *)(SP_sig(sigcontext) & ~15);
     NTSTATUS status;
+#ifdef __APPLE__
+
+    note_exception( rec );
+    /* the frame for this exception does not fit on what is left of the stack, or barely: the
+     * thread is about to be ended for it, so say how it got here first */
+    if ((char *)stack_ptr > (char *)NtCurrentTeb()->DeallocationStack &&
+        (char *)stack_ptr - sizeof(*stack) < (char *)NtCurrentTeb()->DeallocationStack + 0x4000)
+    {
+        dump_native_backtrace( sigcontext, "out of stack while raising an exception" );
+        dump_recent_exceptions();
+    }
+
+#endif
 
     status = send_debug_event( rec, context, TRUE, TRUE );
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
@@ -1531,7 +1604,7 @@ static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
  * symbol, which names the entry point that was called, then the PE ones as addresses.
  * Written with write(), since the thread may be one without a TEB, where ERR() faults.
  */
-static void dump_native_backtrace( ucontext_t *context )
+static void dump_native_backtrace( ucontext_t *context, const char *what )
 {
     struct { ULONG_PTR fp, lr; } frame;
     ULONG_PTR pc = PC_sig(context), fp = FP_sig(context);
@@ -1539,7 +1612,7 @@ static void dump_native_backtrace( ucontext_t *context )
     unsigned int i;
     int len;
 
-    len = snprintf( buffer, sizeof(buffer), "wine: abort() in native code (pid %u), called from:\n", (unsigned int)getpid() );
+    len = snprintf( buffer, sizeof(buffer), "wine: %s (pid %u), called from:\n", what, (unsigned int)getpid() );
     write( 2, buffer, len );
     for (i = 0; i < 64 && pc; i++)
     {
@@ -1579,7 +1652,7 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     EXCEPTION_RECORD rec = { EXCEPTION_WINE_ASSERTION, EXCEPTION_NONCONTINUABLE };
 
 #ifdef __APPLE__
-    dump_native_backtrace( sigcontext );
+    dump_native_backtrace( sigcontext, "abort() in native code" );
     if (!pthread_getspecific( teb_key ))
     {
         /* not a thread of Wine's (the main thread, which runs the run loop, or a queue of
