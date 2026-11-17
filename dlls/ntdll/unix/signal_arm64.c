@@ -52,6 +52,7 @@
 #endif
 #ifdef __APPLE__
 # include <dlfcn.h>
+# include <fcntl.h>
 # include <stdbool.h>
 # include <mach/mach.h>
 # include <sys/mman.h>
@@ -808,6 +809,25 @@ static void dump_recent_exceptions(void)
     }
 }
 
+/* What used the stack up is on the stack: with WINE_STACK_DUMP_DIR set, the used part goes into
+ * a file there, once per process, to be searched for return addresses. */
+static void dump_stack_to_file( const char *sp )
+{
+    static LONG done;
+    const char *dir = getenv( "WINE_STACK_DUMP_DIR" ), *base = NtCurrentTeb()->Tib.StackBase;
+    char path[1024], buffer[1200];
+    int fd, len;
+
+    if (!dir || sp >= base || InterlockedExchange( &done, 1 )) return;
+    snprintf( path, sizeof(path), "%s/wine-stack.%u.%04x.bin", dir, (unsigned int)getpid(),
+              (unsigned int)HandleToULong( NtCurrentTeb()->ClientId.UniqueThread ));
+    if ((fd = open( path, O_WRONLY | O_CREAT | O_TRUNC, 0644 )) == -1) return;
+    write( fd, sp, base - sp );
+    close( fd );
+    len = snprintf( buffer, sizeof(buffer), "wine: the stack from %p to %p is in %s\n", sp, base, path );
+    write( 2, buffer, min( len, (int)sizeof(buffer) - 1 ));
+}
+
 
 #endif
 /***********************************************************************
@@ -828,6 +848,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     {
         dump_native_backtrace( sigcontext, "out of stack while raising an exception" );
         dump_recent_exceptions();
+        dump_stack_to_file( stack_ptr );
     }
 
 #endif
