@@ -6612,8 +6612,30 @@ struct external_key
 {
     struct list entry;
     WCHAR       value[LF_FULLFACESIZE + 12];
+#if defined(__APPLE__) && defined(__aarch64__)
+    WCHAR       file[MAX_PATH];
+#endif
 };
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Whether a value of one of the fonts keys still names the file that was written for an external
+ * font. Proton's wine.inf registers its own fonts under the names of the Mac's (Tahoma, Arial,
+ * ...), by the file names that get linked into the fonts directory. Once such a file is there,
+ * the Mac's font of that name is no longer loaded as an external one, and deleting its value
+ * took the font out of the registry for good: DirectWrite, which lists what the registry
+ * names, then had no Tahoma at all. */
+static BOOL external_value_is_ours( HKEY hkey, const struct external_key *key )
+{
+    char buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[(MAX_PATH + 1) * sizeof(WCHAR)])];
+    KEY_VALUE_PARTIAL_INFORMATION *info = (void *)buffer;
+
+    if (!query_reg_value( hkey, key->value, info, sizeof(buffer) - sizeof(WCHAR) )) return TRUE;
+    if (info->Type != REG_SZ) return TRUE;
+    ((WCHAR *)info->Data)[info->DataLength / sizeof(WCHAR)] = 0;
+    return !wcsicmp( (WCHAR *)info->Data, key->file );
+}
+
+#endif
 static void update_external_font_keys(void)
 {
     struct list external_keys = LIST_INIT(external_keys);
@@ -6653,14 +6675,24 @@ static void update_external_font_keys(void)
         if (tmp && !*tmp) *tmp = ' ';
         if (!(key = malloc( sizeof(*key) ))) break;
         lstrcpyW( key->value, value );
+#if defined(__APPLE__) && defined(__aarch64__)
+        len = min( info->DataLength, sizeof(key->file) - sizeof(WCHAR) );
+        memcpy( key->file, buffer + info->DataOffset, len );
+        key->file[len / sizeof(WCHAR)] = 0;
+#endif
         list_add_tail( &external_keys, &key->entry );
         free( path );
     }
 
     LIST_FOR_EACH_ENTRY_SAFE( key, next, &external_keys, struct external_key, entry )
     {
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (external_value_is_ours( win9x_key, key )) reg_delete_value( win9x_key, key->value );
+        if (external_value_is_ours( winnt_key, key )) reg_delete_value( winnt_key, key->value );
+#else
         reg_delete_value( win9x_key, key->value );
         reg_delete_value( winnt_key, key->value );
+#endif
         reg_delete_value( hkey, key->value );
         list_remove( &key->entry );
         free( key );
