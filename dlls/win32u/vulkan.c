@@ -1580,6 +1580,23 @@ static VkResult win32u_vkCreateImage( VkDevice client_device, const VkImageCreat
         ((VkImageCreateInfo *)create_info)->pNext = &host_external_info; /* cast away const, it has been copied in the thunks */
     }
 
+#ifdef __APPLE__
+    /* An image of linear tiling is a texture made on a buffer for the host driver, and Metal has
+     * those in two dimensions with one level and one layer only: it ends the process over any
+     * other. The driver says as much (maxMipLevels of 1 for linear tiling) to a program that
+     * asks; Red Dead Redemption 2 does not, and makes ones with 7 levels and ones of three
+     * dimensions once it has loaded. They get optimal tiling. */
+    if (create_info->tiling == VK_IMAGE_TILING_LINEAR
+        && (create_info->mipLevels > 1 || create_info->arrayLayers > 1 || create_info->imageType != VK_IMAGE_TYPE_2D))
+    {
+        FIXME( "Linear tiling for type %u with %u mip levels and %u layers (format %u, %ux%ux%u, usage %#x, flags %#x): using optimal tiling.\n",
+               create_info->imageType, create_info->mipLevels, create_info->arrayLayers, create_info->format,
+               create_info->extent.width, create_info->extent.height, create_info->extent.depth,
+               create_info->usage, create_info->flags );
+        ((VkImageCreateInfo *)create_info)->tiling = VK_IMAGE_TILING_OPTIMAL; /* cast away const, it has been copied in the thunks */
+    }
+
+#endif
     return device->p_vkCreateImage( device->host.device, create_info, NULL, image );
 }
 
