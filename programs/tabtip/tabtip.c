@@ -401,6 +401,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     SetEvent(started_event);
 
+#ifdef WINE_MACOS_AARCH64
+    /* The Mac has no on-screen keyboard of Steam's to raise, and without the handler nothing
+     * asks every window that gets the focus for its UI Automation tree. An embedded Chromium
+     * answers that on its main thread: the Rockstar launcher's ran out of stack doing so, and
+     * the launcher waited for its page for ever. */
+    if (use_steam_osk)
+#endif
     if (FAILED(add_uia_event_handler(&uia_iface)))
     {
         ret = -1;
