@@ -53,6 +53,7 @@
 #ifdef __APPLE__
 # include <dlfcn.h>
 # include <stdbool.h>
+# include <mach/mach.h>
 # include <sys/mman.h>
 # include <sys/time.h>
 # include <libkern/OSCacheControl.h>
@@ -1521,6 +1522,53 @@ static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 }
 
 
+#ifdef __APPLE__
+/**********************************************************************
+ *		dump_native_backtrace
+ *
+ * A native library that gives up (Metal's validation, a Vulkan driver's assert) says why on
+ * stderr but not from where. Print the frames that led there: the Unix ones by library and
+ * symbol, which names the entry point that was called, then the PE ones as addresses.
+ * Written with write(), since the thread may be one without a TEB, where ERR() faults.
+ */
+static void dump_native_backtrace( ucontext_t *context )
+{
+    struct { ULONG_PTR fp, lr; } frame;
+    ULONG_PTR pc = PC_sig(context), fp = FP_sig(context);
+    char buffer[512];
+    unsigned int i;
+    int len;
+
+    len = snprintf( buffer, sizeof(buffer), "wine: abort() in native code (pid %u), called from:\n", (unsigned int)getpid() );
+    write( 2, buffer, len );
+    for (i = 0; i < 64 && pc; i++)
+    {
+        vm_size_t size = sizeof(frame);
+        Dl_info info;
+
+        if (dladdr( (void *)pc, &info ) && info.dli_fname)
+        {
+            const char *name = strrchr( info.dli_fname, '/' );
+
+            len = snprintf( buffer, sizeof(buffer), "wine:   %2u: %s+0x%lx %s+0x%lx\n", i, name ? name + 1 : info.dli_fname,
+                            (unsigned long)(pc - (ULONG_PTR)info.dli_fbase), info.dli_sname ? info.dli_sname : "?",
+                            (unsigned long)(info.dli_saddr ? pc - (ULONG_PTR)info.dli_saddr : 0) );
+        }
+        else len = snprintf( buffer, sizeof(buffer), "wine:   %2u: 0x%lx\n", i, (unsigned long)pc );
+        write( 2, buffer, min( len, (int)sizeof(buffer) - 1 ));
+
+        /* the frames are read the way a debugger would, since the chain crosses from the Unix
+         * stack to the PE one and may end anywhere */
+        if (!fp || (fp & 7)) break;
+        if (vm_read_overwrite( mach_task_self(), fp, sizeof(frame), (vm_address_t)&frame, &size )) break;
+        if (frame.fp == fp) break;
+        pc = frame.lr;
+        fp = frame.fp;
+    }
+}
+
+
+#endif
 /**********************************************************************
  *		abrt_handler
  *
@@ -1530,6 +1578,20 @@ static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { EXCEPTION_WINE_ASSERTION, EXCEPTION_NONCONTINUABLE };
 
+#ifdef __APPLE__
+    dump_native_backtrace( sigcontext );
+    if (!pthread_getspecific( teb_key ))
+    {
+        /* not a thread of Wine's (the main thread, which runs the run loop, or a queue of
+         * Metal's or Core Audio's): it has no TEB to raise an exception with, and trying
+         * faults for ever. Let the abort end the process, with a crash report of macOS's. */
+        struct sigaction sig_act = { .sa_handler = SIG_DFL };
+
+        sigaction( SIGABRT, &sig_act, NULL );
+        pthread_kill( pthread_self(), SIGABRT );
+        return;
+    }
+#endif
     setup_exception( sigcontext, &rec );
 }
 
