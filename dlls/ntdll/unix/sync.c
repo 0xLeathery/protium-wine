@@ -2487,8 +2487,18 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
 
         /* Note that we yield after establishing the desired timeout, but
            we only care about the result of the yield for zero timeouts */
+#ifdef __APPLE__
+
+        /* On macOS only a zero timeout yields. The yield lowers the thread's priority until
+         * it has run again, and when the processors are busy that can be a whole quantum
+         * later: one Sleep(1) in a hundred took 10 ms. The sleep gives the processor up
+         * anyway. */
+        if (!when) return NtYieldExecution();
+
+#else
         status = NtYieldExecution();
         if (!when) return status;
+#endif
 
         for (;;)
         {
@@ -2496,9 +2506,35 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
             NtQuerySystemTime( &now );
             diff = (when - now.QuadPart + 9) / 10;
             if (diff <= 0) break;
+#ifdef __APPLE__
+
+            /* macOS ends a thread's sleep late, by up to a quarter of the time asked for and
+             * 5 ms at most, so that timers fire together: Sleep(16) took 20 ms. A timer marked
+             * critical is exempt from that, and a kqueue is what offers one. The time is looked
+             * at again afterwards, also when a signal ended the wait. */
+            {
+                struct kevent64_s event;
+                int ret = -1, queue = kqueue();
+
+                if (queue != -1)
+                {
+                    EV_SET64( &event, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_USECONDS | NOTE_CRITICAL, diff, 0, 0, 0 );
+                    ret = kevent64( queue, &event, 1, &event, 1, 0, NULL );
+                    if (ret == -1 && errno == EINTR) ret = 0;
+                    else if (ret == 1 && (event.flags & EV_ERROR)) ret = -1;
+                    close( queue );
+                }
+                if (ret != -1) continue;
+            }
             tv.tv_sec  = diff / 1000000;
             tv.tv_usec = diff % 1000000;
             if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
+
+#else
+            tv.tv_sec  = diff / 1000000;
+            tv.tv_usec = diff % 1000000;
+            if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
+#endif
         }
     }
     return STATUS_SUCCESS;
