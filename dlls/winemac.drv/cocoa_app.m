@@ -1453,7 +1453,34 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 mouseMoveDeltaY -= event->mouse_moved.y / scale;
             }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+            {
+                /* What the mouse itself did, which is what raw input reports on Windows: its
+                 * movement before the system's pointer acceleration, where the event has that,
+                 * and the pointer's movement otherwise. Whole counts go out, the rest is kept. */
+                static double rawRemainderX, rawRemainderY;
+                CGEventRef cgevent = [anEvent CGEvent];
+                double rawX = cgevent ? CGEventGetDoubleValueField(cgevent, kCGEventUnacceleratedPointerMovementX) : 0;
+                double rawY = cgevent ? CGEventGetDoubleValueField(cgevent, kCGEventUnacceleratedPointerMovementY) : 0;
+
+                if (!rawX && !rawY)
+                {
+                    rawX = [anEvent deltaX] * (retina_on ? 2 : 1);
+                    rawY = [anEvent deltaY] * (retina_on ? 2 : 1);
+                }
+                rawRemainderX += rawX;
+                rawRemainderY += rawY;
+                event->mouse_moved.raw_x = (int)rawRemainderX;
+                event->mouse_moved.raw_y = (int)rawRemainderY;
+                rawRemainderX -= event->mouse_moved.raw_x;
+                rawRemainderY -= event->mouse_moved.raw_y;
+            }
+
+            if (event->type == MOUSE_MOVED_ABSOLUTE || event->mouse_moved.x || event->mouse_moved.y ||
+                event->mouse_moved.raw_x || event->mouse_moved.raw_y)
+#else
             if (event->type == MOUSE_MOVED_ABSOLUTE || event->mouse_moved.x || event->mouse_moved.y)
+#endif
             {
                 event->mouse_moved.time_ms = [self ticksForEventTime:[anEvent timestamp]];
                 event->mouse_moved.drag = drag;

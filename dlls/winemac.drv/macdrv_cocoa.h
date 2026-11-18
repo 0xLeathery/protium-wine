@@ -362,6 +362,11 @@ typedef struct macdrv_event {
             int             y;
             bool            drag;
             unsigned long   time_ms;
+#if defined(__APPLE__) && defined(__aarch64__)
+            /* what the mouse itself did since the event before, for raw input */
+            int             raw_x;
+            int             raw_y;
+#endif
         }                                           mouse_moved;
         struct {
             int             x_scroll;

@@ -158,7 +158,27 @@ static void send_mouse_input(HWND hwnd, macdrv_window cocoa_window, UINT flags, 
     input.mi.time           = time;
     input.mi.dwExtraInfo    = 0;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* Raw input says what the mouse did, never where the pointer is: a game that reads it for
+     * its camera took the pointer's position for a movement of that many counts. So the
+     * pointer's messages go out without raw input, as winex11 sends them, and raw input gets
+     * the buttons and the wheel here and the movement in macdrv_mouse_moved(). */
+    {
+        UINT raw_flags = flags & ~(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE);
+
+        if (raw_flags)
+        {
+            INPUT raw = input;
+
+            raw.mi.dx = raw.mi.dy = 0;
+            raw.mi.dwFlags = raw_flags;
+            NtUserSendHardwareInput(top_level_hwnd, SEND_HWMSG_NO_MSG, &raw, 0);
+        }
+        NtUserSendHardwareInput(top_level_hwnd, SEND_HWMSG_NO_RAW, &input, 0);
+    }
+#else
     NtUserSendHardwareInput(top_level_hwnd, 0, &input, 0);
+#endif
 }
 
 
@@ -913,6 +933,23 @@ void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event)
     if (event->type == MOUSE_MOVED_ABSOLUTE)
         flags |= MOUSEEVENTF_ABSOLUTE;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (event->mouse_moved.raw_x || event->mouse_moved.raw_y)
+    {
+        INPUT raw;
+
+        raw.type           = INPUT_MOUSE;
+        raw.mi.dx          = event->mouse_moved.raw_x;
+        raw.mi.dy          = event->mouse_moved.raw_y;
+        raw.mi.mouseData   = 0;
+        raw.mi.dwFlags     = MOUSEEVENTF_MOVE;
+        raw.mi.time        = event->mouse_moved.time_ms;
+        raw.mi.dwExtraInfo = 0;
+        NtUserSendHardwareInput(NtUserGetAncestor(hwnd, GA_ROOT), SEND_HWMSG_NO_MSG, &raw, 0);
+    }
+    if (event->type == MOUSE_MOVED_RELATIVE && !event->mouse_moved.x && !event->mouse_moved.y) return;
+
+#endif
     send_mouse_input(hwnd, event->window, flags, event->mouse_moved.x, event->mouse_moved.y,
                      0, event->mouse_moved.drag, event->mouse_moved.time_ms);
 }
