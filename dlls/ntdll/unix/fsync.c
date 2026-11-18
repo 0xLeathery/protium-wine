@@ -78,6 +78,124 @@ struct futex_waitv {
 
 #endif
 
+#ifdef __APPLE__
+
+/* macOS has a futex of its own for memory that several processes share: a thread sleeps on one
+ * address for as long as it holds a given value, and another wakes the sleepers of that
+ * address. It has no way to sleep on several addresses at once, which is what futex_waitv is
+ * here for (a wait on several objects, or on one object and the thread's APC slot).
+ *
+ * So each 64K page of objects is followed by a 64K page of the same layout that says, in the 16
+ * bytes of each object, who sleeps for it: a count of the threads asleep on the object's own
+ * address, and 96 bits, one for each "wake channel". A channel is a counter in the shared
+ * memory; each thread has one, by its thread id, which a few threads may share.
+ *
+ * To wait on one object, a thread adds itself to the object's count and sleeps on the object's
+ * address. To wait on several addresses it reads its channel's counter, sets its channel's bit
+ * for each object, checks once more that nothing has changed and sleeps on the counter. Whoever
+ * changes an object wakes the object's address if the count says somebody sleeps there, takes
+ * the object's bits and, for each that was set, moves that channel's counter on and wakes its
+ * sleepers. They look again, and go back to sleep if it was for a thread they share the channel
+ * with. With nobody waiting, a change costs no system call.
+ *
+ * No wake-up is lost because the counter is read before the bits are set and the bits are taken
+ * after the object is changed: a thread that goes to sleep without its bit has had it taken
+ * since it read the counter, and the counter has moved on or will. The count is not taken by
+ * whoever wakes, as a bit is: the object's own value can go back to what the sleeper expects
+ * between its saying that it will sleep and its sleeping. */
+
+#include <AvailabilityMacros.h>
+#ifdef MAC_OS_VERSION_14_4
+#include <os/os_sync_wait_on_address.h>
+#endif
+
+#define FSYNC_UL_COMPARE_AND_WAIT_SHARED    3
+#define FSYNC_UL_COMPARE_AND_WAIT64_SHARED  6
+#define FSYNC_ULF_WAKE_ALL                  0x00000100
+
+extern int __ulock_wait2( uint32_t operation, void *addr, uint64_t value, uint64_t timeout_ns, uint64_t value2 );
+extern int __ulock_wake( uint32_t operation, void *addr, uint64_t wake_value );
+
+/* usleep(0) returns at once on macOS. Where this file calls it, it is to let the threads that
+ * were just woken run before going on, as it does on Linux. */
+static inline int fsync_usleep( useconds_t usec )
+{
+    return usleep( usec ? usec : 50 );
+}
+#define usleep fsync_usleep
+
+/* sleep while the 4 or 8 bytes at addr hold value, for at most timeout_ns (0: for good).
+ * Returns 0 once woken or when they held something else, -1 and errno otherwise. */
+static int fsync_shared_wait( void *addr, uint64_t value, size_t size, uint64_t timeout_ns )
+{
+    int ret, tries = 0;
+
+    do
+    {
+#ifdef MAC_OS_VERSION_14_4
+        if (__builtin_available( macOS 14.4, * ))
+        {
+            if (timeout_ns)
+                ret = os_sync_wait_on_address_with_timeout( addr, value, size, OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+                                                            OS_CLOCK_MACH_ABSOLUTE_TIME, timeout_ns );
+            else
+                ret = os_sync_wait_on_address( addr, value, size, OS_SYNC_WAIT_ON_ADDRESS_SHARED );
+        }
+        else
+#endif
+            ret = __ulock_wait2( size == 8 ? FSYNC_UL_COMPARE_AND_WAIT64_SHARED : FSYNC_UL_COMPARE_AND_WAIT_SHARED,
+                                 addr, value, timeout_ns, 0 );
+        if (ret >= 0) return 0;
+        /* EFAULT: the page is not there for the kernel to look at; reading it brings it in */
+        if (errno != EFAULT) return -1;
+        if (size == 8) { if (__atomic_load_n( (uint64_t *)addr, __ATOMIC_SEQ_CST ) != value) return 0; }
+        else if ((uint32_t)__atomic_load_n( (int *)addr, __ATOMIC_SEQ_CST ) != (uint32_t)value) return 0;
+    } while (++tries < 16);
+
+    errno = EAGAIN;
+    return -1;
+}
+
+static void fsync_shared_wake( void *addr, size_t size )
+{
+#ifdef MAC_OS_VERSION_14_4
+    if (__builtin_available( macOS 14.4, * ))
+    {
+        os_sync_wake_by_address_all( addr, size, OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+        return;
+    }
+#endif
+    __ulock_wake( (size == 8 ? FSYNC_UL_COMPARE_AND_WAIT64_SHARED : FSYNC_UL_COMPARE_AND_WAIT_SHARED) | FSYNC_ULF_WAKE_ALL,
+                  addr, 0 );
+}
+
+static void *get_shm( unsigned int idx );
+
+#define FSYNC_CHANNELS 96
+
+/* who sleeps for the object that addr is part of: three words of channel bits, then the count
+ * of threads asleep on the object's own address */
+static inline unsigned int *fsync_sleepers( void *addr )
+{
+    return (unsigned int *)(((UINT_PTR)addr & ~(UINT_PTR)15) + FSYNC_SHM_PAGE_SIZE);
+}
+
+/* The counter of a wake channel. The server never gives out objects 1 to 64, and the counters
+ * are where the bits of those would be. */
+static uint64_t *fsync_channel_word( unsigned int channel )
+{
+    static uint64_t *words;
+
+    if (!words) words = (uint64_t *)((char *)get_shm( 1 ) + FSYNC_SHM_PAGE_SIZE);
+    return words + channel;
+}
+
+static inline unsigned int fsync_channel(void)
+{
+    return (GetCurrentThreadId() >> 2) % FSYNC_CHANNELS;
+}
+
+#endif  /* __APPLE__ */
 #define u64_to_ptr(x) (void *)(uintptr_t)(x)
 
 struct timespec64
@@ -138,6 +256,180 @@ static void simulate_sched_quantum(void)
     usleep(0);
 }
 
+#ifdef __APPLE__
+
+/* WINE_FSYNC_PARANOID=1: look every tenth of a second and say when a wake-up was missed */
+static int fsync_paranoid = -1;
+
+/* WINE_FSYNC_STATS=10: every ten seconds, say how this process slept: on one object's own
+ * address or on its channel for several, how often the latter was ended by a change that was
+ * not to one of its objects, and how many channels this process woke. */
+static int fsync_stats = -1;
+static unsigned int fsync_stat_direct, fsync_stat_several, fsync_stat_for_nothing, fsync_stat_channels_woken;
+static uint64_t fsync_stat_reported;
+
+static void fsync_stats_report(void)
+{
+    uint64_t now = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+    uint64_t last = __atomic_load_n( &fsync_stat_reported, __ATOMIC_SEQ_CST );
+
+    if (last && now - last < fsync_stats * 1000000000ull) return;
+    if (!__atomic_compare_exchange_n( &fsync_stat_reported, &last, now, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST )) return;
+    if (!last) return;
+    fprintf( stderr, "fsync: pid %u, %.1f s: %u sleeps on one object, %u on several (%u ended for nothing), %u channels woken\n",
+             (unsigned int)getpid(), (now - last) / 1e9,
+             __atomic_exchange_n( &fsync_stat_direct, 0, __ATOMIC_SEQ_CST ),
+             __atomic_exchange_n( &fsync_stat_several, 0, __ATOMIC_SEQ_CST ),
+             __atomic_exchange_n( &fsync_stat_for_nothing, 0, __ATOMIC_SEQ_CST ),
+             __atomic_exchange_n( &fsync_stat_channels_woken, 0, __ATOMIC_SEQ_CST ) );
+}
+
+/* which of the addresses no longer holds its value: count if none */
+static int fsync_changed( const struct futex_waitv *futexes, int count )
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+        if ((uint32_t)__atomic_load_n( (int *)u64_to_ptr(futexes[i].uaddr), __ATOMIC_SEQ_CST ) != (uint32_t)futexes[i].val)
+            break;
+    return i;
+}
+
+/* As futex_waitv: sleep unless one of the addresses no longer holds its value, until one of
+ * them is woken or the time is up. Returns 0 when woken through a single address, and -1 with
+ * errno ETIMEDOUT when the time is up; anything else means "look again". An entry with
+ * __reserved set is not an object of the shared memory and has nothing that says who sleeps. */
+static int futex_wait_multiple( const struct futex_waitv *futexes,
+        int count, const struct timespec64 *end, clockid_t clock_id )
+{
+    const uint64_t slice = 100000000;
+    const int direct = (count == 1 && !futexes[0].__reserved);
+    uint64_t timeout_ns = 0, ns, *channel = NULL, word;
+    int i, ret, err;
+
+    if (end)
+    {
+        struct timespec now;
+        LONGLONG left;
+
+        clock_gettime( clock_id, &now );
+        left = (end->tv_sec - now.tv_sec) * (LONGLONG)1000000000 + (end->tv_nsec - now.tv_nsec);
+        if (left <= 0)
+        {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        timeout_ns = left;
+    }
+
+    if (fsync_paranoid == -1)
+    {
+        const char *env = getenv( "WINE_FSYNC_PARANOID" );
+        fsync_paranoid = env && atoi( env );
+    }
+    if (fsync_stats == -1)
+    {
+        const char *env = getenv( "WINE_FSYNC_STATS" );
+        fsync_stats = env ? max( atoi( env ), 0 ) : 0;
+    }
+    if (fsync_stats) fsync_stats_report();
+
+    for (;;)
+    {
+        /* the paranoid never sleep for more than a tenth of a second without looking */
+        ns = timeout_ns;
+        if (fsync_paranoid && (!ns || ns > slice)) ns = slice;
+
+        if (direct)
+        {
+            unsigned int *sleepers = fsync_sleepers( u64_to_ptr(futexes[0].uaddr) );
+
+            __atomic_add_fetch( &sleepers[3], 1, __ATOMIC_SEQ_CST );
+            ret = fsync_shared_wait( u64_to_ptr(futexes[0].uaddr), futexes[0].val, 4, ns );
+            err = errno;
+            __atomic_sub_fetch( &sleepers[3], 1, __ATOMIC_SEQ_CST );
+            if (fsync_stats) __atomic_add_fetch( &fsync_stat_direct, 1, __ATOMIC_RELAXED );
+        }
+        else
+        {
+            const unsigned int bit = fsync_channel();
+
+            channel = fsync_channel_word( bit );
+            word = __atomic_load_n( channel, __ATOMIC_SEQ_CST );
+            for (i = 0; i < count; i++)
+            {
+                unsigned int *bits;
+
+                if (futexes[i].__reserved) continue;
+                bits = fsync_sleepers( u64_to_ptr(futexes[i].uaddr) ) + bit / 32;
+                if (!(__atomic_load_n( bits, __ATOMIC_SEQ_CST ) & (1u << (bit % 32))))
+                    __atomic_fetch_or( bits, 1u << (bit % 32), __ATOMIC_SEQ_CST );
+            }
+            if (fsync_changed( futexes, count ) != count)
+            {
+                errno = EAGAIN;
+                return -1;
+            }
+            ret = fsync_shared_wait( channel, word, 8, ns );
+            err = errno;
+            if (fsync_stats)
+            {
+                __atomic_add_fetch( &fsync_stat_several, 1, __ATOMIC_RELAXED );
+                if (!ret && fsync_changed( futexes, count ) == count)
+                    __atomic_add_fetch( &fsync_stat_for_nothing, 1, __ATOMIC_RELAXED );
+            }
+        }
+
+        if (ret >= 0 || err != ETIMEDOUT || ns == timeout_ns) break;
+
+        /* a sleep that ends by the clock while an address has changed is a wake-up that did
+         * not arrive */
+        if ((i = fsync_changed( futexes, count )) != count)
+        {
+            ERR( "wake-up lost: %d address(es), [%d] at %p holds %#x, not %#x any more\n", count, i,
+                 u64_to_ptr(futexes[i].uaddr), *(int *)u64_to_ptr(futexes[i].uaddr), (int)futexes[i].val );
+            errno = EAGAIN;
+            return -1;
+        }
+        if (timeout_ns) timeout_ns -= ns;
+    }
+
+    if (ret < 0)
+    {
+        errno = err;
+        return ret;
+    }
+    if (direct) return 0;
+    /* woken, for one of these objects or for a thread of the same channel: the caller looks again */
+    errno = EAGAIN;
+    return -1;
+}
+
+/* wake everything that sleeps for an object whose state was just changed */
+static inline int futex_wake( int *addr, int val )
+{
+    unsigned int *sleepers = fsync_sleepers( addr ), bits, i;
+
+    __sync_synchronize();
+    if (__atomic_load_n( &sleepers[3], __ATOMIC_SEQ_CST )) fsync_shared_wake( addr, 4 );
+    for (i = 0; i < FSYNC_CHANNELS / 32; i++)
+    {
+        if (!__atomic_load_n( &sleepers[i], __ATOMIC_SEQ_CST )) continue;
+        bits = __atomic_exchange_n( &sleepers[i], 0, __ATOMIC_SEQ_CST );
+        while (bits)
+        {
+            uint64_t *channel = fsync_channel_word( i * 32 + __builtin_ctz( bits ) );
+
+            bits &= bits - 1;
+            __atomic_add_fetch( channel, 1, __ATOMIC_SEQ_CST );
+            fsync_shared_wake( channel, 8 );
+            if (fsync_stats > 0) __atomic_add_fetch( &fsync_stat_channels_woken, 1, __ATOMIC_RELAXED );
+        }
+    }
+    return 0;
+}
+
+#else
 static inline int futex_wait_multiple( const struct futex_waitv *futexes,
         int count, const struct timespec64 *end, clockid_t clock_id )
 {
@@ -156,6 +448,7 @@ static inline int futex_wake( int *addr, int val )
     return -1;
 #endif
 }
+#endif
 
 struct fsync
 {
@@ -206,6 +499,22 @@ static void *get_shm( unsigned int idx )
         return NULL;
     }
 
+#ifdef __APPLE__
+    if (!shm_addrs[entry])
+    {
+        /* the page of objects and, right behind it, the page that says who sleeps for them */
+        void *addr = mmap( NULL, 2 * FSYNC_SHM_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd,
+                           (off_t)entry * 2 * FSYNC_SHM_PAGE_SIZE );
+        if (addr == (void *)-1)
+            ERR("Failed to map page %d (offset %s).\n", entry,
+                 wine_dbgstr_longlong((off_t)entry * 2 * FSYNC_SHM_PAGE_SIZE));
+
+        TRACE("Mapping page %d at %p.\n", entry, addr);
+
+        if (__sync_val_compare_and_swap( &shm_addrs[entry], 0, addr ))
+            munmap( addr, 2 * FSYNC_SHM_PAGE_SIZE ); /* someone beat us to it */
+    }
+#else
     if (!shm_addrs[entry])
     {
         void *addr = mmap( NULL, FSYNC_SHM_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd,
@@ -219,6 +528,7 @@ static void *get_shm( unsigned int idx )
         if (__sync_val_compare_and_swap( &shm_addrs[entry], 0, addr ))
             munmap( addr, FSYNC_SHM_PAGE_SIZE ); /* someone beat us to it */
     }
+#endif
 
     return (char *)shm_addrs[entry] + offset;
 }
@@ -461,12 +771,16 @@ void fsync_init( DWORD pid )
 
 
     fsync_enabled = 1;
+#ifdef __APPLE__
+    /* the server only says so where the shared wait is there, and there is no futex_waitv to try */
+#else
     syscall( __NR_futex_waitv, NULL, 0, 0, NULL, 0 );
     if (errno == ENOSYS || errno == EPERM)
     {
         ERR("Server is running with WINEFSYNC but this process can't use __NR_futex_waitv.\n");
         exit(1);
     }
+#endif
 
     if (stat( config_dir, &st ) == -1)
         ERR("Cannot stat %s\n", config_dir);
@@ -946,6 +1260,9 @@ NTSTATUS fsync_wait_objects( DWORD count, const HANDLE *handles,
                 {
                     /* Avoid breaking things entirely. */
                     futex_vector_set( &futexes[i], &dummy_futex, dummy_futex );
+#ifdef __APPLE__
+                    futexes[i].__reserved = 1;  /* on the stack: nothing says who sleeps for it */
+#endif
                 }
             }
 

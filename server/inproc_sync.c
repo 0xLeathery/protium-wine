@@ -40,6 +40,25 @@
 #include "ntsync_tmp.h"
 #endif
 
+#ifdef __APPLE__
+/* The code below is written around Linux's ntsync driver and only there when the driver's
+ * header is. fsync goes through the same code: it is the branch taken when the driver cannot
+ * be opened, which on macOS is always. These are the driver's names that the code needs to be
+ * compiled; none of its ioctls is ever made here. */
+#include <sys/ioccom.h>
+typedef uint32_t __u32;
+struct ntsync_sem_args   { __u32 count; __u32 max; };
+struct ntsync_mutex_args { __u32 owner; __u32 count; };
+struct ntsync_event_args { __u32 manual; __u32 signaled; };
+#define NTSYNC_IOC_CREATE_SEM    _IOW('N', 0x80, struct ntsync_sem_args)
+#define NTSYNC_IOC_CREATE_MUTEX  _IOW('N', 0x84, struct ntsync_mutex_args)
+#define NTSYNC_IOC_MUTEX_KILL    _IOW('N', 0x86, __u32)
+#define NTSYNC_IOC_CREATE_EVENT  _IOW('N', 0x87, struct ntsync_event_args)
+#define NTSYNC_IOC_EVENT_SET     _IOR('N', 0x88, __u32)
+#define NTSYNC_IOC_EVENT_RESET   _IOR('N', 0x89, __u32)
+#define NTSYNC_IOC_EVENT_READ    _IOR('N', 0x8d, struct ntsync_event_args)
+
+#endif
 #ifdef NTSYNC_IOC_EVENT_READ
 
 #include <fcntl.h>

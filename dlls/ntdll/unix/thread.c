@@ -76,6 +76,9 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#ifdef __APPLE__
+#include "fsync.h"
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -1105,7 +1108,12 @@ static void contexts_from_server( CONTEXT *context, struct context_data server_c
  */
 static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
 {
+#ifdef __APPLE__
+    /* with fsync it is the thread's place in the shared memory, not a file descriptor */
+    if (!do_fsync()) close( ntdll_get_thread_data()->alert_fd );
+#else
     close( ntdll_get_thread_data()->alert_fd );
+#endif
     close( ntdll_get_thread_data()->wait_fd[0] );
     close( ntdll_get_thread_data()->wait_fd[1] );
     close( ntdll_get_thread_data()->reply_fd );

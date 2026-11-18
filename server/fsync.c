@@ -54,13 +54,51 @@
 
 int do_fsync_cached = -1;
 
+#ifdef __APPLE__
+
+/* The macOS side of fsync: see dlls/ntdll/unix/fsync.c for how its waits and wakes work here.
+ * macOS cannot make a shared memory object bigger once it has a size, so it gets all of it at
+ * the start: 1024 pages of objects, each followed by the page that says who sleeps for them,
+ * which is room for some four million objects. Pages that are never touched cost nothing. */
+
+#include <AvailabilityMacros.h>
+#ifdef MAC_OS_VERSION_14_4
+#include <os/os_sync_wait_on_address.h>
+#endif
+
+#define FSYNC_MAC_PAGES                     1024
+#define FSYNC_CHANNELS                      96
+#define FSYNC_UL_COMPARE_AND_WAIT_SHARED    3
+#define FSYNC_UL_COMPARE_AND_WAIT64_SHARED  6
+#define FSYNC_ULF_WAKE_ALL                  0x00000100
+
+extern int __ulock_wake( uint32_t operation, void *addr, uint64_t wake_value );
+
+static void fsync_shared_wake( void *addr, size_t size )
+{
+#ifdef MAC_OS_VERSION_14_4
+    if (__builtin_available( macOS 14.4, * ))
+    {
+        os_sync_wake_by_address_all( addr, size, OS_SYNC_WAKE_BY_ADDRESS_SHARED );
+        return;
+    }
+#endif
+    __ulock_wake( (size == 8 ? FSYNC_UL_COMPARE_AND_WAIT64_SHARED : FSYNC_UL_COMPARE_AND_WAIT_SHARED) | FSYNC_ULF_WAKE_ALL,
+                  addr, 0 );
+}
+
+#endif  /* __APPLE__ */
 int fsync_check_support(void)
 {
 #ifdef __linux__
     syscall( __NR_futex_waitv, 0, 0, 0, 0, 0 );
     return getenv( "WINEFSYNC" ) && atoi(getenv( "WINEFSYNC" )) && errno != ENOSYS && errno != EPERM;
 #else
+#ifdef __APPLE__
+    return getenv( "WINEFSYNC" ) && atoi(getenv( "WINEFSYNC" ));
+#else
     return 0;
+#endif
 #endif
 }
 
@@ -107,7 +145,11 @@ void fsync_init(void)
     shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
     shm_addrs_size = 128;
 
+#ifdef __APPLE__
+    shm_size = (off_t)FSYNC_MAC_PAGES * 2 * FSYNC_SHM_PAGE_SIZE;
+#else
     shm_size = FSYNC_SHM_PAGE_SIZE;
+#endif
     if (ftruncate( shm_fd, shm_size ) == -1)
         perror( "ftruncate" );
 
@@ -118,7 +160,13 @@ void fsync_init(void)
     shm_idx_free_map_size = 256;
     shm_idx_free_map = malloc( shm_idx_free_map_size * sizeof(*shm_idx_free_map) );
     memset( shm_idx_free_map, 0xff, shm_idx_free_map_size * sizeof(*shm_idx_free_map) );
+#ifdef __APPLE__
+    /* Nor 1 to 64: the wake channels' counters are where their sleepers would be noted. */
+    shm_idx_free_map[0] = 0;
+    shm_idx_free_map[1] &= ~(uint64_t)1;
+#else
     shm_idx_free_map[0] &= ~(uint64_t)1; /* Avoid allocating shm_index 0. */
+#endif
 
     atexit( shm_cleanup );
 }
@@ -150,6 +198,26 @@ static void *get_shm( unsigned int idx )
         shm_addrs_size = new_size;
     }
 
+#ifdef __APPLE__
+    if (!shm_addrs[entry])
+    {
+        /* the page of objects and, right behind it, the page that says who sleeps for them */
+        void *addr = mmap( NULL, 2 * FSYNC_SHM_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd,
+                          (off_t)entry * 2 * FSYNC_SHM_PAGE_SIZE );
+        if (addr == (void *)-1)
+        {
+            fprintf( stderr, "fsync: failed to map page %d (offset %#zx): ",
+                     entry, (size_t)entry * 2 * FSYNC_SHM_PAGE_SIZE );
+            perror( "mmap" );
+        }
+
+        if (debug_level)
+            fprintf( stderr, "fsync: Mapping page %d at %p.\n", entry, addr );
+
+        if (__sync_val_compare_and_swap( &shm_addrs[entry], 0, addr ))
+            munmap( addr, 2 * FSYNC_SHM_PAGE_SIZE ); /* someone beat us to it */
+    }
+#else
     if (!shm_addrs[entry])
     {
         void *addr = mmap( NULL, FSYNC_SHM_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd,
@@ -167,6 +235,7 @@ static void *get_shm( unsigned int idx )
         if (__sync_val_compare_and_swap( &shm_addrs[entry], 0, addr ))
             munmap( addr, FSYNC_SHM_PAGE_SIZE ); /* someone beat us to it */
     }
+#endif
 
     return (void *)((unsigned long)shm_addrs[entry] + offset);
 }
@@ -240,7 +309,51 @@ unsigned int fsync_alloc_shm( int low, int high )
 
     return shm_idx;
 #else
+#ifdef __APPLE__
+    static int warned;
+    unsigned int i;
+    int shm_idx;
+    int *shm;
+
+    /* as on Linux, nothing for the master socket */
+    if (!is_fsync_initialized)
+        return 0;
+
+    for (i = shm_idx_free_search_start_hint; i < shm_idx_free_map_size; ++i)
+        if ((shm_idx = alloc_shm_idx_from_word( i ))) break;
+
+    if (!shm_idx)
+    {
+        uint32_t old_size, new_size;
+        uint64_t *new_alloc;
+
+        old_size = shm_idx_free_map_size;
+        new_size = old_size + 256;
+        /* the shared memory has its size for good here: no index past its end */
+        if ((uint64_t)new_size * BITS_IN_FREE_MAP_WORD * 16 > (uint64_t)FSYNC_MAC_PAGES * FSYNC_SHM_PAGE_SIZE
+            || !(new_alloc = realloc( shm_idx_free_map, new_size * sizeof(*new_alloc) )))
+        {
+            if (!warned++) fprintf( stderr, "fsync: no room for more objects in the shared memory.\n" );
+            return 0;
+        }
+        memset( new_alloc + old_size, 0xff, (new_size - old_size) * sizeof(*new_alloc) );
+        shm_idx_free_map = new_alloc;
+        shm_idx_free_map_size = new_size;
+        shm_idx = alloc_shm_idx_from_word( old_size );
+    }
+
+    shm = get_shm( shm_idx );
+    assert(shm);
+    shm[0] = low;
+    shm[1] = high;
+    shm[2] = 1; /* Reference count. */
+    shm[3] = 0; /* Last reference process id. */
+    memset( (char *)shm + FSYNC_SHM_PAGE_SIZE, 0, 16 ); /* nobody sleeps for it */
+
+    return shm_idx;
+#else
     return 0;
+#endif
 #endif
 }
 
@@ -308,6 +421,34 @@ int fsync_grab_shm_idx( unsigned int shm_idx )
     return shm_idx;
 }
 
+#ifdef __APPLE__
+
+/* wake everything that sleeps for an object whose state was just changed: as futex_wake() in
+ * dlls/ntdll/unix/fsync.c */
+static inline int futex_wake( int *addr, int val )
+{
+    unsigned int *sleepers = (unsigned int *)(((unsigned long)addr & ~15ul) + FSYNC_SHM_PAGE_SIZE), bits, i;
+    uint64_t *channels = (uint64_t *)((char *)get_shm( 1 ) + FSYNC_SHM_PAGE_SIZE);
+
+    __sync_synchronize();
+    if (__atomic_load_n( &sleepers[3], __ATOMIC_SEQ_CST )) fsync_shared_wake( addr, 4 );
+    for (i = 0; i < FSYNC_CHANNELS / 32; i++)
+    {
+        if (!__atomic_load_n( &sleepers[i], __ATOMIC_SEQ_CST )) continue;
+        bits = __atomic_exchange_n( &sleepers[i], 0, __ATOMIC_SEQ_CST );
+        while (bits)
+        {
+            uint64_t *channel = channels + i * 32 + __builtin_ctz( bits );
+
+            bits &= bits - 1;
+            __atomic_add_fetch( channel, 1, __ATOMIC_SEQ_CST );
+            fsync_shared_wake( channel, 8 );
+        }
+    }
+    return 0;
+}
+
+#else
 static inline int futex_wake( int *addr, int val )
 {
 #ifdef __NR_futex
@@ -317,6 +458,7 @@ static inline int futex_wake( int *addr, int val )
     return -1;
 #endif
 }
+#endif
 
 /* shm layout for events or event-like objects. */
 struct fsync_event
