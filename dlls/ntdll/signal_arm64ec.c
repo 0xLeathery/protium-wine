@@ -1271,7 +1271,20 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     for (;;)
     {
         status = virtual_unwind( UNW_FLAG_EHANDLER, &dispatch, &context, need_backtrace( rec->ExceptionCode ) );
+#ifdef WINE_MACOS_AARCH64
+        /* Frames that cannot be unwound end the search, as a stack that is not valid does. An
+         * exception raised for it instead would only come to the same frames again, and on the
+         * emulator's stack, which has no guard page. */
+        if (status != STATUS_SUCCESS)
+        {
+            ERR( "frames at %I64x cannot be unwound, code %lx at %p is not handled\n",
+                 context.Pc, rec->ExceptionCode, rec->ExceptionAddress );
+            rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
+            break;
+        }
+#else
         if (status != STATUS_SUCCESS) return status;
+#endif
 
     unwind_done:
         if (!dispatch.EstablisherFrame) break;

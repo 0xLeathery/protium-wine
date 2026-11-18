@@ -887,7 +887,13 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
     TRACE( "type %lx base %I64x pc %I64x rva %I64x sp %I64x\n", type, base, pc, pc - base, context->Sp );
     if (limit_low || limit_high) FIXME( "limits not supported\n" );
 
+#ifdef WINE_MACOS_AARCH64
+    /* For a frame that was unwound to, pc is the frame's Pc less 4, and never equal to Lr: a
+     * frame without unwind data that returns to itself was then unwound without end. */
+    if (!func && (pc == context->Lr || context->Pc == context->Lr)) return STATUS_BAD_FUNCTION_TABLE;
+#else
     if (!func && pc == context->Lr) return STATUS_BAD_FUNCTION_TABLE;  /* invalid leaf function */
+#endif
 
     context->ContextFlags |= CONTEXT_UNWOUND_TO_CALL;
 
