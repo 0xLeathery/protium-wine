@@ -1188,9 +1188,22 @@ static NSString* WineLocalizedString(unsigned int stringID)
             [eventQueuesLock lock];
             for (queue in eventQueues)
             {
+#if defined(__APPLE__) && defined(__aarch64__)
+                /* Their pointer movement is void now. What the mouse did is not: an event that
+                 * has some stays, as one that moves the pointer by nothing. */
+                [queue discardEventsPassingTest:^BOOL (macdrv_event* event){
+                    if (event->type != MOUSE_MOVED_RELATIVE && event->type != MOUSE_MOVED_ABSOLUTE) return FALSE;
+                    if (!event->mouse_moved.raw_x && !event->mouse_moved.raw_y) return TRUE;
+                    event->type = MOUSE_MOVED_RELATIVE;
+                    event->mouse_moved.x = 0;
+                    event->mouse_moved.y = 0;
+                    return FALSE;
+                }];
+#else
                 [queue discardEventsMatchingMask:event_mask_for_type(MOUSE_MOVED_RELATIVE) |
                                                  event_mask_for_type(MOUSE_MOVED_ABSOLUTE)
                                        forWindow:nil];
+#endif
                 [queue resetMouseEventPositions:pos];
             }
             [eventQueuesLock unlock];
@@ -1324,6 +1337,31 @@ static NSString* WineLocalizedString(unsigned int stringID)
         macdrv_release_event(event);
     }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* What the mouse itself did, which is what raw input reports on Windows: its movement before
+     * the system's pointer acceleration, where the event has that, and the pointer's movement
+     * otherwise. Whole counts go into the event, the rest is kept for the next one. */
+    static void set_raw_mouse_movement(NSEvent *anEvent, macdrv_event *event)
+    {
+        static double rawRemainderX, rawRemainderY;
+        CGEventRef cgevent = [anEvent CGEvent];
+        double rawX = cgevent ? CGEventGetDoubleValueField(cgevent, kCGEventUnacceleratedPointerMovementX) : 0;
+        double rawY = cgevent ? CGEventGetDoubleValueField(cgevent, kCGEventUnacceleratedPointerMovementY) : 0;
+
+        if (!rawX && !rawY)
+        {
+            rawX = [anEvent deltaX] * (retina_on ? 2 : 1);
+            rawY = [anEvent deltaY] * (retina_on ? 2 : 1);
+        }
+        rawRemainderX += rawX;
+        rawRemainderY += rawY;
+        event->mouse_moved.raw_x = (int)rawRemainderX;
+        event->mouse_moved.raw_y = (int)rawRemainderY;
+        rawRemainderX -= event->mouse_moved.raw_x;
+        rawRemainderY -= event->mouse_moved.raw_y;
+    }
+
+#endif
     - (void) handleMouseMove:(NSEvent*)anEvent
     {
         WineWindow* targetWindow;
@@ -1363,8 +1401,30 @@ static NSString* WineLocalizedString(unsigned int stringID)
             // later than that time.
             if (lastSetCursorPositionTime)
             {
+#if defined(__APPLE__) && defined(__aarch64__)
+                if ([anEvent timestamp] <= lastSetCursorPositionTime)
+                {
+                    /* Where the pointer went before the program moved it no longer says
+                     * anything. The mouse did move though, and a program that reads raw input
+                     * and puts the pointer back all the time is owed that movement: it goes out
+                     * as an event that moves the pointer by nothing. */
+                    event = macdrv_create_event(MOUSE_MOVED_RELATIVE, targetWindow);
+                    event->mouse_moved.x = 0;
+                    event->mouse_moved.y = 0;
+                    set_raw_mouse_movement(anEvent, event);
+                    if (event->mouse_moved.raw_x || event->mouse_moved.raw_y)
+                    {
+                        event->mouse_moved.time_ms = [self ticksForEventTime:[anEvent timestamp]];
+                        event->mouse_moved.drag = drag;
+                        [targetWindow.queue postEvent:event];
+                    }
+                    macdrv_release_event(event);
+                    return;
+                }
+#else
                 if ([anEvent timestamp] <= lastSetCursorPositionTime)
                     return;
+#endif
 
                 lastSetCursorPositionTime = 0;
                 forceNextMouseMoveAbsolute = TRUE;
@@ -1454,27 +1514,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
             }
 
 #if defined(__APPLE__) && defined(__aarch64__)
-            {
-                /* What the mouse itself did, which is what raw input reports on Windows: its
-                 * movement before the system's pointer acceleration, where the event has that,
-                 * and the pointer's movement otherwise. Whole counts go out, the rest is kept. */
-                static double rawRemainderX, rawRemainderY;
-                CGEventRef cgevent = [anEvent CGEvent];
-                double rawX = cgevent ? CGEventGetDoubleValueField(cgevent, kCGEventUnacceleratedPointerMovementX) : 0;
-                double rawY = cgevent ? CGEventGetDoubleValueField(cgevent, kCGEventUnacceleratedPointerMovementY) : 0;
-
-                if (!rawX && !rawY)
-                {
-                    rawX = [anEvent deltaX] * (retina_on ? 2 : 1);
-                    rawY = [anEvent deltaY] * (retina_on ? 2 : 1);
-                }
-                rawRemainderX += rawX;
-                rawRemainderY += rawY;
-                event->mouse_moved.raw_x = (int)rawRemainderX;
-                event->mouse_moved.raw_y = (int)rawRemainderY;
-                rawRemainderX -= event->mouse_moved.raw_x;
-                rawRemainderY -= event->mouse_moved.raw_y;
-            }
+            set_raw_mouse_movement(anEvent, event);
 
             if (event->type == MOUSE_MOVED_ABSOLUTE || event->mouse_moved.x || event->mouse_moved.y ||
                 event->mouse_moved.raw_x || event->mouse_moved.raw_y)
