@@ -63,6 +63,21 @@ static NTSTATUS (WINAPI *pThreadInit)(void);
 static void     (WINAPI *pThreadTerm)(HANDLE,LONG);
 static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
 
+#ifdef WINE_MACOS_AARCH64
+/* The emulator frees the lookup table of a thread that ends and only then takes the table's
+ * range off its list of ranges to commit on first use. A thread that starts in between is given
+ * the same address, puts it on the list and sees it taken off again, and its first lookup is then
+ * a fault that nobody handles. With one thread at a time in ThreadInit and ThreadTerm no thread
+ * starts in between. */
+static RTL_CRITICAL_SECTION emulator_thread_section;
+static RTL_CRITICAL_SECTION_DEBUG emulator_thread_debug =
+{
+    0, 0, &emulator_thread_section,
+    { &emulator_thread_debug.ProcessLocksList, &emulator_thread_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": emulator_thread_section") }
+};
+static RTL_CRITICAL_SECTION emulator_thread_section = { &emulator_thread_debug, -1, 0, 0, 0, 0 };
+#endif
 static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
 static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
 extern void KiUserExceptionDispatcher_thunk(void) asm("EXP+#KiUserExceptionDispatcher");
@@ -252,7 +267,13 @@ NTSTATUS arm64ec_thread_init(void)
     NTSTATUS status = STATUS_SUCCESS;
 
     enter_syscall_callback();
+#ifdef WINE_MACOS_AARCH64
+    RtlEnterCriticalSection( &emulator_thread_section );
     if (pThreadInit) status = pThreadInit();
+    RtlLeaveCriticalSection( &emulator_thread_section );
+#else
+    if (pThreadInit) status = pThreadInit();
+#endif
     leave_syscall_callback();
     return status;
 }
@@ -915,7 +936,13 @@ NTSTATUS SYSCALL_API NtTerminateThread( HANDLE handle, LONG exit_code )
 
     if (pThreadTerm && enter_syscall_callback())
     {
+#ifdef WINE_MACOS_AARCH64
+        RtlEnterCriticalSection( &emulator_thread_section );
         pThreadTerm( handle, exit_code );
+        RtlLeaveCriticalSection( &emulator_thread_section );
+#else
+        pThreadTerm( handle, exit_code );
+#endif
         status = syscall_NtTerminateThread( handle, exit_code );
         leave_syscall_callback();
         return status;
