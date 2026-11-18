@@ -718,11 +718,48 @@ NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_
 
 NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
 {
+#ifdef WINE_MACOS_AARCH64
+    /* Windows reads and writes the context in the kernel, where a pointer it cannot use is a
+     * status it returns. Here the x86-64 context is converted in user mode, and a bad pointer
+     * was an exception in the caller instead: Call of Duty: WWII asks with a null context as
+     * it starts, expects the call to fail, and ended on the access violation. The context is
+     * read through the kernel side first, which raises nothing, so that a program's own
+     * exception handlers see no fault either; the handlers below are for what that cannot
+     * tell (a context that can be read and not written, or one freed in between). */
+    ARM64_NT_CONTEXT arm_ctx = { 0 };
+    ARM64EC_NT_CONTEXT probe;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (NtReadVirtualMemory( NtCurrentProcess(), context, &probe, sizeof(probe), NULL ))
+        return STATUS_ACCESS_VIOLATION;
+    __TRY
+    {
+        arm_ctx.ContextFlags = ctx_flags_x64_to_arm( context->ContextFlags );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        status = STATUS_ACCESS_VIOLATION;
+    }
+    __ENDTRY
+    if (status) return status;
+    if ((status = syscall_NtGetContextThread( handle, &arm_ctx ))) return status;
+    __TRY
+    {
+        context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        status = STATUS_ACCESS_VIOLATION;
+    }
+    __ENDTRY
+    return status;
+#else
     ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = ctx_flags_x64_to_arm( context->ContextFlags ) };
     NTSTATUS status = syscall_NtGetContextThread( handle, &arm_ctx );
 
     if (!status) context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx );
     return status;
+#endif
 }
 
 static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, ULONG alloc,
@@ -834,7 +871,26 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
 {
     ARM64_NT_CONTEXT arm_ctx;
 
+#ifdef WINE_MACOS_AARCH64
+    /* a context that cannot be read is a status, as in NtGetContextThread() */
+    ARM64EC_NT_CONTEXT probe;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (NtReadVirtualMemory( NtCurrentProcess(), context, &probe, sizeof(probe), NULL ))
+        return STATUS_ACCESS_VIOLATION;
+    __TRY
+    {
+        context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        status = STATUS_ACCESS_VIOLATION;
+    }
+    __ENDTRY
+    if (status) return status;
+#else
     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+#endif
     return syscall_NtSetContextThread( handle, &arm_ctx );
 }
 
