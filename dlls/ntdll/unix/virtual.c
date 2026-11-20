@@ -5876,8 +5876,24 @@ SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T
 void virtual_wx_prepare_write( void *addr, SIZE_T size )
 {
     char *ptr = ROUND_ADDR( addr, host_page_mask ), *end = (char *)addr + size;
+#ifdef __APPLE__
+    BYTE *state;
+#endif
 
     if (!pages_wx_exec || !size) return;
+#ifdef __APPLE__
+
+    /* Nearly every buffer is on a stack or a heap, none of whose pages was ever mapped
+     * executable, and this is called for every reply: with virtual_mutex taken each time, a
+     * thread's server calls waited for whatever another thread was allocating or freeing (a
+     * fifth of a registry query's time next to two threads that allocate). The bytes are read
+     * without it first; their chunks are never freed. A page that another thread maps
+     * executable just now could as well be mapped so after the mutex is released below. */
+    for ( ; ptr < end; ptr += host_page_size)
+        if ((state = get_wx_exec_ptr( ptr, FALSE )) && (*state & WX_PAGE_EXEC)) break;
+    if (ptr >= end) return;
+
+#endif
     mutex_lock( &virtual_mutex );  /* signals are blocked during server calls */
     for ( ; ptr < end; ptr += host_page_size)
     {
