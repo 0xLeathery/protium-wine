@@ -2131,6 +2131,71 @@ static BOOL is_process_wow64( const CLIENT_ID *id )
     return ret;
 }
 
+#ifdef __APPLE__
+
+/* What the server said about the calling thread, kept for a short time.
+ *
+ * A game asks for its own thread's priority all the time (GetThreadPriority() is
+ * ThreadBasicInformation): Call of Duty: WWII's main and server threads spent 30% of their
+ * time in that request. Of a thread's basic information only the priority and the affinity
+ * change while the thread can still ask, and its own process changes them through
+ * NtSetInformationThread(), which counts in thread_info_changes, as does NtClose(), after
+ * which a handle's value may name another thread. A change from another process is seen
+ * when the time is up. Nothing is kept about other threads, whose exit code must be right
+ * the moment they end. */
+struct own_thread_info
+{
+    DWORD                    tid;      /* the calling thread, 0 for an unused entry */
+    HANDLE                   handle;   /* the handle it asked with */
+    LONG                     changes;  /* thread_info_changes from before the server was asked */
+    ULONGLONG                time;     /* when, in ns */
+    THREAD_BASIC_INFORMATION info;
+};
+
+#define OWN_THREAD_INFO_NS 10000000  /* 10 ms */
+
+LONG thread_info_changes = 0;
+static struct own_thread_info own_thread_infos[32];
+static pthread_mutex_t own_thread_info_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static struct own_thread_info *own_thread_info_entry( HANDLE handle )
+{
+    return &own_thread_infos[(GetCurrentThreadId() / 4 + (handle == GetCurrentThread())) % ARRAY_SIZE(own_thread_infos)];
+}
+
+static BOOL get_own_thread_info( HANDLE handle, THREAD_BASIC_INFORMATION *info )
+{
+    struct own_thread_info *entry = own_thread_info_entry( handle );
+    BOOL ret;
+
+    pthread_mutex_lock( &own_thread_info_mutex );
+    ret = (entry->tid == GetCurrentThreadId() && entry->handle == handle &&
+           entry->changes == ReadNoFence( &thread_info_changes ) &&
+           clock_gettime_nsec_np( CLOCK_UPTIME_RAW ) - entry->time < OWN_THREAD_INFO_NS);
+    if (ret) *info = entry->info;
+    pthread_mutex_unlock( &own_thread_info_mutex );
+    return ret;
+}
+
+/* changes is thread_info_changes as it was before the server was asked: an answer that a
+ * change may have overtaken is not kept */
+static void set_own_thread_info( HANDLE handle, const THREAD_BASIC_INFORMATION *info, LONG changes )
+{
+    struct own_thread_info *entry = own_thread_info_entry( handle );
+
+    if (HandleToULong( info->ClientId.UniqueThread ) != GetCurrentThreadId() ||
+        HandleToULong( info->ClientId.UniqueProcess ) != GetCurrentProcessId()) return;
+    pthread_mutex_lock( &own_thread_info_mutex );
+    entry->tid     = GetCurrentThreadId();
+    entry->handle  = handle;
+    entry->changes = changes;
+    entry->time    = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
+    entry->info    = *info;
+    pthread_mutex_unlock( &own_thread_info_mutex );
+}
+
+
+#endif  /* __APPLE__ */
 /******************************************************************************
  *              NtQueryInformationThread  (NTDLL.@)
  */
@@ -2147,6 +2212,16 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         THREAD_BASIC_INFORMATION info;
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
+#ifdef __APPLE__
+        LONG changes = ReadNoFence( &thread_info_changes );
+
+        if (!is_old_wow64() && get_own_thread_info( handle, &info ))
+        {
+            if (data) memcpy( data, &info, min( length, sizeof(info) ));
+            if (ret_len) *ret_len = min( length, sizeof(info) );
+            return STATUS_SUCCESS;
+        }
+#endif
 
         SERVER_START_REQ( get_thread_info )
         {
@@ -2172,6 +2247,9 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
                 else
                     info.TebBaseAddress = NULL;
             }
+#ifdef __APPLE__
+            else set_own_thread_info( handle, &info, changes );
+#endif
             if (data) memcpy( data, &info, min( length, sizeof(info) ));
             if (ret_len) *ret_len = min( length, sizeof(info) );
         }
@@ -2444,8 +2522,27 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
 /******************************************************************************
  *              NtSetInformationThread  (NTDLL.@)
  */
+#ifdef __APPLE__
+static NTSTATUS set_information_thread( HANDLE handle, THREADINFOCLASS class, const void *data, ULONG length );
+
+/* counted before and after the change: what a thread was told about itself in between may be
+ * from before it */
 NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
                                         const void *data, ULONG length )
+{
+    NTSTATUS status;
+
+    InterlockedIncrement( &thread_info_changes );
+    status = set_information_thread( handle, class, data, length );
+    InterlockedIncrement( &thread_info_changes );
+    return status;
+}
+
+static NTSTATUS set_information_thread( HANDLE handle, THREADINFOCLASS class, const void *data, ULONG length )
+#else
+NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
+                                        const void *data, ULONG length )
+#endif
 {
     unsigned int status;
 

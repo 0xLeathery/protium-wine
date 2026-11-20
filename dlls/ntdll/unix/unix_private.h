@@ -326,6 +326,9 @@ extern BOOL virtual_check_buffer_for_read( const void *ptr, SIZE_T size );
 extern BOOL virtual_check_buffer_for_write( void *ptr, SIZE_T size );
 extern SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T size );
 extern NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZE_T size );
+#ifdef __APPLE__
+extern LONG thread_info_changes;
+#endif
 #if defined(__APPLE__) && defined(__aarch64__)
 extern void virtual_wx_prepare_write( void *addr, SIZE_T size );
 extern BOOL virtual_wx_begin_displaced_store( const void *pc, const void *addr );

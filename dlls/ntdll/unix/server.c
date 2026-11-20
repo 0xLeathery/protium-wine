@@ -1970,6 +1970,10 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     if (HandleToLong( handle ) >= ~5 && HandleToLong( handle ) <= ~0)
         return STATUS_SUCCESS;
 
+#ifdef __APPLE__
+    /* the handle's value may come back as a handle to another thread */
+    InterlockedIncrement( &thread_info_changes );
+#endif
     /* hold fd_cache_mutex to prevent the fd from being added again between the
      * call to remove_fd_from_cache and close_handle */
     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
