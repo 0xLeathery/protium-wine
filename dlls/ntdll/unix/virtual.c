@@ -1379,6 +1379,115 @@ static BYTE get_host_page_vprot( const void *addr )
 }
 
 
+#ifdef __APPLE__
+
+/* Long runs of pages whose vprot bytes are equal under a mask, as page indexes [start, end).
+ * A program that commits a large reservation piece by piece has its memory queried at every
+ * step (an x86 emulator asks before each commit and protect), and each answer would otherwise
+ * read the bytes of all that is still reserved, 16 MB of them for a 64 GB reservation.
+ * A run says nothing about the pages around it. All uses are under virtual_mutex. */
+struct vprot_run
+{
+    size_t start;
+    size_t end;
+    BYTE   mask;
+    UINT   used;   /* vprot_run_uses when it last answered */
+};
+
+#define VPROT_RUN_COUNT     8
+#define VPROT_RUN_MIN_PAGES ((size_t)0x4000000 >> page_shift)  /* shorter ones are quick to read */
+
+static struct vprot_run vprot_runs[VPROT_RUN_COUNT];
+static UINT vprot_run_uses;
+
+/* the end of the run that has this page, for this mask */
+static size_t find_vprot_run( size_t idx, BYTE mask )
+{
+    unsigned int i;
+
+    for (i = 0; i < VPROT_RUN_COUNT; i++)
+    {
+        if (idx < vprot_runs[i].start || idx >= vprot_runs[i].end || vprot_runs[i].mask != mask) continue;
+        vprot_runs[i].used = ++vprot_run_uses;
+        return vprot_runs[i].end;
+    }
+    return 0;
+}
+
+/* remember a run that has just been read */
+static void add_vprot_run( size_t start, size_t end, BYTE mask )
+{
+    struct vprot_run *run, *oldest = &vprot_runs[0];
+    unsigned int i;
+
+    if (end - start < VPROT_RUN_MIN_PAGES) return;
+
+    for (i = 0; i < VPROT_RUN_COUNT; i++)
+    {
+        run = &vprot_runs[i];
+        if (run->mask == mask && run->start < end && start < run->end)
+        {
+            /* two runs that share a page are one run */
+            run->start = min( run->start, start );
+            run->end = max( run->end, end );
+            run->used = ++vprot_run_uses;
+            return;
+        }
+        /* an empty one first, then the one that answered longest ago */
+        if (oldest->start == oldest->end) continue;
+        if (run->start == run->end || (int)(run->used - oldest->used) < 0) oldest = run;
+    }
+    oldest->start = start;
+    oldest->end = end;
+    oldest->mask = mask;
+    oldest->used = ++vprot_run_uses;
+}
+
+/* the vprot bytes of these pages are about to change: keep the longer side of each run */
+static void forget_vprot_runs( size_t start, size_t end )
+{
+    unsigned int i;
+
+    for (i = 0; i < VPROT_RUN_COUNT; i++)
+    {
+        struct vprot_run *run = &vprot_runs[i];
+
+        if (run->start >= end || start >= run->end) continue;
+        if (start > run->start && start - run->start >= (run->end > end ? run->end - end : 0)) run->end = start;
+        else if (run->end > end) run->start = end;
+        else run->start = run->end = 0;
+    }
+}
+
+static SIZE_T read_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vprot );
+
+/* get_vprot_range_size() below, which reads the bytes, with the pages of a remembered run
+ * taken as read */
+static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vprot )
+{
+    size_t start = (size_t)base >> page_shift, known = find_vprot_run( start, mask );
+    SIZE_T ret = 0;
+
+    if (known)
+    {
+        BYTE next;
+
+        *vprot = get_page_vprot( base );
+        ret = (known - start) << page_shift;
+        if (ret >= size) return size;
+        /* the run may go on where the remembered one ends */
+        if (!((get_page_vprot( base + ret ) ^ *vprot) & mask))
+            ret += read_vprot_range_size( base + ret, size - ret, mask, &next );
+    }
+    else ret = read_vprot_range_size( base, size, mask, vprot );
+
+    add_vprot_run( start, start + (ret >> page_shift), mask );
+    return ret;
+}
+
+#define get_vprot_range_size read_vprot_range_size
+
+#endif  /* __APPLE__ */
 /***********************************************************************
  *           get_vprot_range_size
  *
@@ -1432,6 +1541,9 @@ static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vp
     }
     return size;
 }
+#ifdef __APPLE__
+#undef get_vprot_range_size
+#endif
 
 /***********************************************************************
  *           set_page_vprot
@@ -1442,6 +1554,9 @@ static void set_page_vprot( const void *addr, size_t size, BYTE vprot )
 {
     size_t idx = (size_t)addr >> page_shift;
     size_t end = ((size_t)addr + size + page_mask) >> page_shift;
+#ifdef __APPLE__
+    forget_vprot_runs( idx, end );
+#endif
 
 #ifdef _WIN64
     while (idx >> pages_vprot_shift != end >> pages_vprot_shift)
@@ -1466,6 +1581,9 @@ static void set_page_vprot_bits( const void *addr, size_t size, BYTE set, BYTE c
 {
     size_t idx = (size_t)addr >> page_shift;
     size_t end = ((size_t)addr + size + page_mask) >> page_shift;
+#ifdef __APPLE__
+    forget_vprot_runs( idx, end );
+#endif
 
 #ifdef _WIN64
     for ( ; idx < end; idx++)
@@ -1490,6 +1608,9 @@ static BOOL set_page_vprot_exec_write_protect( const void *addr, size_t size )
 #ifdef _WIN64 /* only supported on 64-bit so assume 2-level table */
     size_t idx = (size_t)addr >> page_shift;
     size_t end = ((size_t)addr + size + page_mask) >> page_shift;
+#ifdef __APPLE__
+    forget_vprot_runs( idx, end );
+#endif
 
     for ( ; idx < end; idx++)
     {
