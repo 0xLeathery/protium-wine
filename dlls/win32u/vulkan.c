@@ -1973,6 +1973,45 @@ static void win32u_vkGetPhysicalDeviceProperties2KHR( VkPhysicalDevice client_ph
     get_physical_device_properties2( physical_device, properties2, physical_device->instance->p_vkGetPhysicalDeviceProperties2KHR );
 }
 
+#ifdef __APPLE__
+/* Windows' Vulkan drivers list VK_FORMAT_B8G8R8A8_UNORM in the sRGB colour space first, and games
+ * written for them take the first surface format to be that one. Red Dead Redemption 2 pairs the
+ * first format it wants with the first surface format and keeps no display modes when they
+ * differ: it offers no resolutions and crashes when set to fullscreen. KosmicKrisp lists
+ * B8G8R8A8_SRGB first. That format moves to the front; the others keep their order. */
+static void put_bgra8_unorm_first_stride( VkSurfaceFormatKHR *formats, UINT32 count, size_t stride )
+{
+#define SURFACE_FORMAT(i) ((VkSurfaceFormatKHR *)((char *)formats + (i) * stride))
+    VkSurfaceFormatKHR first;
+    UINT32 i, found = count;
+
+    for (i = 0; i < count; i++)
+    {
+        if (SURFACE_FORMAT(i)->format != VK_FORMAT_B8G8R8A8_UNORM) continue;
+        if (found == count) found = i;
+        if (SURFACE_FORMAT(i)->colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+        {
+            found = i;
+            break;
+        }
+    }
+    if (found == count || !found) return;
+    first = *SURFACE_FORMAT(found);
+    for (i = found; i; i--) *SURFACE_FORMAT(i) = *SURFACE_FORMAT(i - 1);
+    *SURFACE_FORMAT(0) = first;
+#undef SURFACE_FORMAT
+}
+
+/* Only when no entry chains structures of its own, which would then describe another format. */
+static void put_bgra8_unorm_first2( VkSurfaceFormat2KHR *formats, UINT32 count )
+{
+    UINT32 i;
+
+    for (i = 0; i < count; i++) if (formats[i].pNext) return;
+    put_bgra8_unorm_first_stride( &formats[0].surfaceFormat, count, sizeof(*formats) );
+}
+
+#endif
 static VkResult win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice client_physical_device, VkSurfaceKHR client_surface,
                                                              uint32_t *format_count, VkSurfaceFormatKHR *formats )
 {
@@ -1980,8 +2019,19 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice cl
     struct surface *surface = surface_from_handle( client_surface );
     struct vulkan_instance *instance = physical_device->instance;
 
+#ifdef __APPLE__
+    {
+        VkResult res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
+                                                                        surface->obj.host.surface, format_count, formats );
+
+        if (formats && (res == VK_SUCCESS || res == VK_INCOMPLETE))
+            put_bgra8_unorm_first_stride( formats, *format_count, sizeof(*formats) );
+        return res;
+    }
+#else
     return instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
                                                                 surface->obj.host.surface, format_count, formats );
+#endif
 }
 
 static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice client_physical_device, const VkPhysicalDeviceSurfaceInfo2KHR *surface_info,
@@ -2014,8 +2064,15 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice c
 
     surface_info_host.surface = surface->obj.host.surface;
 
+#ifdef __APPLE__
+    res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
+                                                            &surface_info_host, format_count, formats );
+    if (formats && (res == VK_SUCCESS || res == VK_INCOMPLETE)) put_bgra8_unorm_first2( formats, *format_count );
+    return res;
+#else
     return instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
                                                                  &surface_info_host, format_count, formats );
+#endif
 }
 
 static VkBool32 win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR( VkPhysicalDevice client_physical_device, uint32_t queue )
