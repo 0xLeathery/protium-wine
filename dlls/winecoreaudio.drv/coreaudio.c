@@ -719,6 +719,108 @@ static AudioDeviceID dev_id_from_device(const char *device)
     return id;
 }
 
+#ifdef __APPLE__
+/* A shared render stream made on the system's default output follows it when it changes, as
+ * Windows moves the streams of the default endpoint and PulseAudio those of the default sink:
+ * headphones that connect while a game plays then get its sound, where the stream used to stay
+ * on the device it was made on. The change arrives on a thread of Core Audio's, where Wine's
+ * debug output must not be used, so nothing here logs. */
+static os_unfair_lock follow_lock = OS_UNFAIR_LOCK_INIT;
+static struct coreaudio_stream *follow_streams[64];
+static unsigned int follow_count;
+static BOOL follow_listening;
+
+static AudioDeviceID get_default_output_device(void)
+{
+    const AudioObjectPropertyAddress addr =
+    {
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+        .mSelector = kAudioHardwarePropertyDefaultOutputDevice,
+    };
+    AudioDeviceID id = kAudioObjectUnknown;
+    UInt32 size = sizeof(id);
+
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, 0, NULL, &size, &id) != noErr)
+        return kAudioObjectUnknown;
+    return id;
+}
+
+/* The unit converts the stream's format to the device's, so it only needs that format again. */
+static void move_stream_to_device(struct coreaudio_stream *stream, AudioDeviceID id)
+{
+    AudioChannelLayout layout;
+
+    AudioOutputUnitStop(stream->unit);
+    AudioUnitUninitialize(stream->unit);
+    if (AudioUnitSetProperty(stream->unit, kAudioOutputUnitProperty_CurrentDevice,
+                             kAudioUnitScope_Global, 0, &id, sizeof(id)) == noErr)
+    {
+        AudioUnitSetProperty(stream->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0,
+                             &stream->dev_desc, sizeof(stream->dev_desc));
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelBitmap;
+        layout.mChannelBitmap = (stream->fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) ?
+                                ((WAVEFORMATEXTENSIBLE *)stream->fmt)->dwChannelMask : 0x3;
+        layout.mNumberChannelDescriptions = 0;
+        AudioUnitSetProperty(stream->unit, kAudioUnitProperty_AudioChannelLayout, kAudioUnitScope_Input, 0,
+                             &layout, sizeof(layout));
+        os_unfair_lock_lock(&stream->lock);
+        stream->dev_id = id;
+        os_unfair_lock_unlock(&stream->lock);
+    }
+    if (AudioUnitInitialize(stream->unit) == noErr) AudioOutputUnitStart(stream->unit);
+}
+
+static OSStatus default_output_changed(AudioObjectID object, UInt32 count,
+                                       const AudioObjectPropertyAddress *addrs, void *user)
+{
+    AudioDeviceID id = get_default_output_device();
+    unsigned int i;
+
+    if (id == kAudioObjectUnknown) return noErr;
+    os_unfair_lock_lock(&follow_lock);
+    for (i = 0; i < follow_count; i++)
+        if (follow_streams[i]->dev_id != id) move_stream_to_device(follow_streams[i], id);
+    os_unfair_lock_unlock(&follow_lock);
+    return noErr;
+}
+
+static void follow_default_output(struct coreaudio_stream *stream)
+{
+    const AudioObjectPropertyAddress addr =
+    {
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+        .mSelector = kAudioHardwarePropertyDefaultOutputDevice,
+    };
+
+    if (stream->flow != eRender || stream->share != AUDCLNT_SHAREMODE_SHARED) return;
+    if (stream->dev_id != get_default_output_device()) return;
+
+    os_unfair_lock_lock(&follow_lock);
+    if (!follow_listening && AudioObjectAddPropertyListener(kAudioObjectSystemObject, &addr,
+                                                            default_output_changed, NULL) == noErr)
+        follow_listening = TRUE;
+    if (follow_count < sizeof(follow_streams) / sizeof(follow_streams[0]))
+        follow_streams[follow_count++] = stream;
+    os_unfair_lock_unlock(&follow_lock);
+}
+
+static void unfollow_default_output(struct coreaudio_stream *stream)
+{
+    unsigned int i;
+
+    os_unfair_lock_lock(&follow_lock);
+    for (i = 0; i < follow_count; i++)
+    {
+        if (follow_streams[i] != stream) continue;
+        follow_streams[i] = follow_streams[--follow_count];
+        break;
+    }
+    os_unfair_lock_unlock(&follow_lock);
+}
+
+#endif
 static NTSTATUS unix_create_stream(void *args)
 {
     struct create_stream_params *params = args;
@@ -814,6 +916,9 @@ end:
     } else {
         *params->channel_count = params->fmt->nChannels;
         *params->stream = (stream_handle)(UINT_PTR)stream;
+#ifdef __APPLE__
+        follow_default_output(stream);
+#endif
     }
 
     return STATUS_SUCCESS;
@@ -825,6 +930,10 @@ static NTSTATUS unix_release_stream( void *args )
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
     SIZE_T size;
 
+#ifdef __APPLE__
+    unfollow_default_output(stream);
+
+#endif
     if(params->timer_thread){
         stream->please_quit = TRUE;
         NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
