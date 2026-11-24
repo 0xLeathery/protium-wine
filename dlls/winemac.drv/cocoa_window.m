@@ -414,7 +414,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
 @property (readonly, copy, nonatomic) NSArray* childWineWindows;
 
-@property (retain, nonatomic) CAShapeLayer* contentViewMaskLayer;
+@property (retain, nonatomic) CALayer* contentViewMaskLayer;
 
     - (void) setShape:(CGPathRef)newShape;
 
@@ -2771,9 +2771,15 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) setMask:(CGRect)rect
     {
-        /* Draw black bars to cover every part of the window except for 'rect'.
+        /* Draw black bars to cover every part of the window except for 'rect', which is in
+         * the window's own coordinates as Wine counts them: from its top left corner, in pixels.
          * Intended for use on a window covering the full screen.
          */
+        NSView *view = self.contentView;
+        CGRect keep, bounds, bars[4];
+        CALayer *container;
+        int i;
+
         if (self.contentViewMaskLayer)
         {
             [self.contentViewMaskLayer removeFromSuperlayer];
@@ -2783,37 +2789,32 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         if (CGRectIsEmpty(rect))
             return;
 
-        CAShapeLayer *shapeLayer = [CAShapeLayer layer];
-        shapeLayer.bounds = self.contentView.layer.bounds;
-        shapeLayer.position = self.contentView.layer.position;
-        shapeLayer.geometryFlipped = self.contentView.layer.geometryFlipped;
-        shapeLayer.anchorPoint = self.contentView.layer.anchorPoint;
-        shapeLayer.fillColor = CGColorGetConstantColor(kCGColorBlack);
+        /* The content view counts in points and from its top left corner too; what its layer
+         * does, the view itself says for each bar. */
+        keep = cgrect_mac_from_win(rect);
+        bounds = NSRectToCGRect(view.bounds);
+        bars[0] = CGRectMake(0, 0, CGRectGetMinX(keep), bounds.size.height);                                   /* left */
+        bars[1] = CGRectMake(CGRectGetMaxX(keep), 0, bounds.size.width - CGRectGetMaxX(keep), bounds.size.height); /* right */
+        bars[2] = CGRectMake(0, 0, bounds.size.width, CGRectGetMinY(keep));                                     /* top */
+        bars[3] = CGRectMake(0, CGRectGetMaxY(keep), bounds.size.width, bounds.size.height - CGRectGetMaxY(keep)); /* bottom */
 
-        CGMutablePathRef path = CGPathCreateMutable();
-        /* left/right */
-        if (rect.origin.x > 0.0)
-            CGPathAddRect(path, NULL, CGRectMake(0, 0, rect.origin.x, shapeLayer.bounds.size.height));
-        if (rect.origin.x + rect.size.width < shapeLayer.bounds.size.width)
-            CGPathAddRect(path, NULL, CGRectMake(rect.origin.x + rect.size.width,
-                                                 0,
-                                                 shapeLayer.bounds.size.width - (rect.origin.x + rect.size.width),
-                                                 shapeLayer.bounds.size.height));
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        container = [CALayer layer];
+        container.frame = view.layer.bounds;
+        for (i = 0; i < 4; i++)
+        {
+            CALayer *bar;
 
-        /* top/bottom */
-        if (rect.origin.y > 0.0)
-            CGPathAddRect(path, NULL, CGRectMake(0, 0, shapeLayer.bounds.size.width, rect.origin.y));
-        if (rect.origin.y + rect.size.height < shapeLayer.bounds.size.height)
-            CGPathAddRect(path, NULL, CGRectMake(0,
-                                                 rect.origin.y + rect.size.height,
-                                                 shapeLayer.bounds.size.width,
-                                                 shapeLayer.bounds.size.height - (rect.origin.y + rect.size.height)));
-
-        shapeLayer.path = path;
-        CGPathRelease(path);
-
-        [self.contentView.layer addSublayer:shapeLayer];
-        self.contentViewMaskLayer = shapeLayer;
+            if (bars[i].size.width <= 0 || bars[i].size.height <= 0) continue;
+            bar = [CALayer layer];
+            bar.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+            bar.frame = NSRectToCGRect([view convertRectToLayer:NSRectFromCGRect(bars[i])]);
+            [container addSublayer:bar];
+        }
+        [view.layer addSublayer:container];
+        [CATransaction commit];
+        self.contentViewMaskLayer = container;
     }
 
 
