@@ -4119,11 +4119,66 @@ void WINAPI LdrShutdownProcess(void)
 }
 
 
+#ifdef WINE_MACOS_AARCH64
+/* With WINE_EXIT_TRACE set, say who asked a process to end: every value on the exiting thread's
+ * stack that points into a module, with the module and the offset in it, nearest first. A game
+ * that ends itself without a word (an exit with status 0 a few seconds after its start) leaves
+ * nothing else to find the reason by, and a debugger makes many of them behave differently. */
+static void trace_exit_callers( DWORD status )
+{
+    WCHAR buffer[32];
+    UNICODE_STRING name = RTL_CONSTANT_STRING( L"WINE_EXIT_TRACE" );
+    UNICODE_STRING value = { 0, sizeof(buffer) - sizeof(WCHAR), buffer };
+    ULONG_PTR peek;
+    void **sp = (void **)(((ULONG_PTR)&value + 7) & ~(ULONG_PTR)7);
+    void **top = NtCurrentTeb()->Tib.StackBase;
+    LDR_DATA_TABLE_ENTRY *mod;
+    int count = 0;
+
+    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) == STATUS_VARIABLE_NOT_FOUND) return;
+    MESSAGE( "wine: thread %04lx ends the process with status %lu; module addresses on its stack:\n",
+             GetCurrentThreadId(), status );
+    /* WINE_EXIT_TRACE=<hex address> also shows four 64-bit values there, as they are now */
+    buffer[value.Length / sizeof(WCHAR)] = 0;
+    if ((peek = _wcstoui64( buffer, NULL, 16 )) > 0x10000)
+    {
+        ULONG64 seen[4];
+
+        NTSTATUS read = NtReadVirtualMemory( GetCurrentProcess(), (void *)peek, seen, sizeof(seen), NULL );
+
+        if (read) MESSAGE( "wine:   %p cannot be read: status %#lx\n", (void *)peek, read );
+        else MESSAGE( "wine:   at %p: %016I64x %016I64x %016I64x %016I64x\n", (void *)peek,
+                      seen[0], seen[1], seen[2], seen[3] );
+    }
+    for ( ; sp < top && count < 160; sp++)
+    {
+        if (LdrFindEntryForAddress( *sp, &mod )) continue;
+        MESSAGE( "wine:   %p %s+%#Ix\n", *sp, debugstr_w(mod->BaseDllName.Buffer),
+                 (ULONG_PTR)*sp - (ULONG_PTR)mod->DllBase );
+        count++;
+    }
+    /* What the thread called last before it came here is still below its stack pointer, where
+     * the calls on the way here have not written over it: a main function that returned leaves
+     * the return addresses of its last calls there. Nearest the stack pointer first. */
+    MESSAGE( "wine: and below its stack pointer, from calls that have returned:\n" );
+    sp = (void **)(((ULONG_PTR)&value + 7) & ~(ULONG_PTR)7) - 1;
+    for (count = 0; (char *)sp > (char *)NtCurrentTeb()->Tib.StackLimit && count < 0x1000; sp--, count++)
+    {
+        if (LdrFindEntryForAddress( *sp, &mod )) continue;
+        MESSAGE( "wine:   -%#x %p %s+%#Ix\n", count * 8, *sp, debugstr_w(mod->BaseDllName.Buffer),
+                 (ULONG_PTR)*sp - (ULONG_PTR)mod->DllBase );
+    }
+}
+
+#endif
 /******************************************************************
  *		RtlExitUserProcess (NTDLL.@)
  */
 void WINAPI RtlExitUserProcess( DWORD status )
 {
+#ifdef WINE_MACOS_AARCH64
+    trace_exit_callers( status );
+#endif
     RtlEnterCriticalSection( &loader_section );
     RtlAcquirePebLock();
     NtTerminateProcess( 0, status );
