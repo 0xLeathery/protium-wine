@@ -276,6 +276,26 @@ static inline DWORD get_config_key(HKEY defkey, HKEY appkey, const char *name,
  *
  * Set up the Mac driver options.
  */
+#if defined(__APPLE__) && defined(__aarch64__)
+/***********************************************************************
+ *              main_display_is_hidpi
+ *
+ * Whether the main display's current mode has two pixels to a point each way.
+ */
+static bool main_display_is_hidpi(void)
+{
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+    bool ret;
+
+    if (!mode) return false;
+    ret = CGDisplayModeGetPixelWidth(mode) == 2 * CGDisplayModeGetWidth(mode) &&
+          CGDisplayModeGetPixelHeight(mode) == 2 * CGDisplayModeGetHeight(mode);
+    CGDisplayModeRelease(mode);
+    return ret;
+}
+#endif
+
+
 static void setup_options(void)
 {
     static const WCHAR macdriverW[] = {'\\','M','a','c',' ','D','r','i','v','e','r',0};
@@ -376,6 +396,24 @@ static void setup_options(void)
        processes in the prefix. */
     if (!get_config_key(hkey, NULL, "RetinaMode", buffer, sizeof(buffer)))
         retina_enabled = IS_OPTION_TRUE(buffer[0]);
+#if defined(__APPLE__) && defined(__aarch64__)
+    else
+    {
+        /* With nothing in the registry, a display that has two pixels to a point is shown to
+         * programs at its pixels, as Windows shows a high-density display, and any other at its
+         * points as before: Retina mode on a display of one pixel to a point would double its
+         * size and have the window server scale everything back down. Every process asks the
+         * display itself, so the processes of a prefix agree without anything being handed from
+         * one to the next. WINE_MAC_RETINA=0 keeps points, =1 is Retina mode whatever the
+         * display. */
+        const char *env = getenv("WINE_MAC_RETINA");
+
+        if (env && (!strcmp(env, "0") || !strcmp(env, "1")))
+            retina_enabled = env[0] == '1';
+        else
+            retina_enabled = main_display_is_hidpi();
+    }
+#endif
 
     retina_on = retina_enabled;
 
