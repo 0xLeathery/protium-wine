@@ -947,6 +947,19 @@ void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event)
         raw.mi.dwExtraInfo = 0;
         NtUserSendHardwareInput(NtUserGetAncestor(hwnd, GA_ROOT), SEND_HWMSG_NO_MSG, &raw, 0);
     }
+    {
+        /* WINE_MOUSE_TRACE: when the program's thread took the movement, and how much of it */
+        static int trace = -1;
+        if (trace < 0) trace = getenv("WINE_MOUSE_TRACE") != NULL;
+        if (trace)
+        {
+            struct timespec now;
+            clock_gettime(CLOCK_UPTIME_RAW, &now);
+            fprintf(stderr, "wine: mouse out %.3f ms raw %d,%d %s %d,%d\n",
+                    now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0, event->mouse_moved.raw_x, event->mouse_moved.raw_y,
+                    event->type == MOUSE_MOVED_RELATIVE ? "rel" : "abs", event->mouse_moved.x, event->mouse_moved.y);
+        }
+    }
     if (event->type == MOUSE_MOVED_RELATIVE && !event->mouse_moved.x && !event->mouse_moved.y) return;
 
 #endif

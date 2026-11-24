@@ -932,6 +932,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
             {
                 [NSCursor hide];
                 cursorHidden = TRUE;
+#if defined(__APPLE__) && defined(__aarch64__)
+                [self enterVirtualPointer];
+#endif
             }
 
             if (!cursorIsCurrent)
@@ -942,6 +945,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
             if (!clientWantsCursorHidden && cursorHidden)
             {
+#if defined(__APPLE__) && defined(__aarch64__)
+                [self leaveVirtualPointer];
+#endif
                 [NSCursor unhide];
                 cursorHidden = FALSE;
             }
@@ -955,6 +961,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
             }
             if (cursorHidden)
             {
+#if defined(__APPLE__) && defined(__aarch64__)
+                [self leaveVirtualPointer];
+#endif
                 [NSCursor unhide];
                 cursorHidden = FALSE;
             }
@@ -1142,10 +1151,115 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
     }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* A game that turns its camera with the mouse hides the pointer, keeps it in its window and
+     * puts it back in the middle every frame, then reads how far it got from there. Moving the
+     * system's pointer for that is what made it uneven: the move holds this thread for about a
+     * frame, every event made before it then says nothing about where the pointer is (about half
+     * of the mouse's movement was dropped), and the events after it carry the jump in their
+     * deltas. So while the pointer is hidden it is Wine's alone: the mouse is taken off the
+     * system's pointer, which stays where it is, the program's moves only change where Wine
+     * says the pointer is, and each mouse event moves that on by its own delta. The system's
+     * pointer is put where Wine's is when the pointer shows again. WINE_MOUSE_VIRTUAL=0 turns
+     * this off. */
+    static BOOL virtualPointerMoved;      /* the pointer is Wine's alone right now */
+    static CGPoint virtualPointerPos;
+
+    static BOOL mouse_trace_enabled(void)
+    {
+        static int enabled = -1;
+        if (enabled < 0) enabled = getenv("WINE_MOUSE_TRACE") != NULL;
+        return enabled;
+    }
+
+    - (BOOL) pointerIsVirtual
+    {
+        static int allowed = -1;
+        if (allowed < 0)
+        {
+            const char *env = getenv("WINE_MOUSE_VIRTUAL");
+            allowed = !env || atoi(env);
+        }
+        return allowed && virtualPointerMoved && ![windowsBeingDragged count];
+    }
+
+    - (void) enterVirtualPointer
+    {
+        const char *env = getenv("WINE_MOUSE_VIRTUAL");
+        if (virtualPointerMoved || (env && !atoi(env))) return;
+        virtualPointerPos = NSPointToCGPoint([self flippedMouseLocation:[NSEvent mouseLocation]]);
+        virtualPointerMoved = TRUE;
+        CGAssociateMouseAndMouseCursorPosition(false);
+        /* macOS merges the mouse movements that wait for an application into one event, which
+         * then says where the pointer is but carries the movement of the last of them only.
+         * Here the movement is all there is, so every event is taken. */
+        [NSEvent setMouseCoalescingEnabled:NO];
+        if (mouse_trace_enabled()) fprintf(stderr, "wine: mouse pointer is Wine's alone from %.0f,%.0f\n",
+                                           virtualPointerPos.x, virtualPointerPos.y);
+    }
+
+    /* the system's pointer goes where the program last put Wine's, plus what the mouse did since */
+    - (void) leaveVirtualPointer
+    {
+        CGRect screen = CGDisplayBounds(CGMainDisplayID());
+        uint32_t count, i;
+        CGDirectDisplayID displays[16];
+
+        if (!virtualPointerMoved) return;
+        virtualPointerMoved = FALSE;
+        [NSEvent setMouseCoalescingEnabled:YES];
+        if (CGGetActiveDisplayList(16, displays, &count) == kCGErrorSuccess)
+            for (i = 0; i < count; i++) screen = CGRectUnion(screen, CGDisplayBounds(displays[i]));
+        virtualPointerPos.x = fmax(CGRectGetMinX(screen), fmin(CGRectGetMaxX(screen) - 1, virtualPointerPos.x));
+        virtualPointerPos.y = fmax(CGRectGetMinY(screen), fmin(CGRectGetMaxY(screen) - 1, virtualPointerPos.y));
+        if (self.clippingCursor) [clipCursorHandler clipCursorLocation:&virtualPointerPos];
+        if (mouse_trace_enabled()) fprintf(stderr, "wine: mouse pointer is the system's again at %.0f,%.0f\n",
+                                           virtualPointerPos.x, virtualPointerPos.y);
+        CGSetLocalEventsSuppressionInterval(0);
+        CGWarpMouseCursorPosition(virtualPointerPos);
+        CGSetLocalEventsSuppressionInterval(0.25);
+        CGAssociateMouseAndMouseCursorPosition(true);
+        lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
+    }
+
+#endif
     - (BOOL) setCursorPosition:(CGPoint)pos
     {
         BOOL ret;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+        if ([self pointerIsVirtual])
+        {
+            WineEventQueue* queue;
+
+            if (self.clippingCursor) [clipCursorHandler clipCursorLocation:&pos];
+            virtualPointerPos = pos;
+            /* events waiting for the program stay: a relative one still says how far the mouse
+             * went, and only one that names a place is void (its raw movement is kept) */
+            [eventQueuesLock lock];
+            for (queue in eventQueues)
+            {
+                [queue discardEventsPassingTest:^BOOL (macdrv_event* event){
+                    if (event->type != MOUSE_MOVED_ABSOLUTE) return FALSE;
+                    if (!event->mouse_moved.raw_x && !event->mouse_moved.raw_y) return TRUE;
+                    event->type = MOUSE_MOVED_RELATIVE;
+                    event->mouse_moved.x = 0;
+                    event->mouse_moved.y = 0;
+                    return FALSE;
+                }];
+                [queue resetMouseEventPositions:pos];
+            }
+            [eventQueuesLock unlock];
+            return TRUE;
+        }
+        if (mouse_trace_enabled())
+        {
+            static int said;
+            if (said++ < 20) fprintf(stderr, "wine: mouse set to %.0f,%.0f the system's way: hidden %d/%d clipping %d\n",
+                                     pos.x, pos.y, clientWantsCursorHidden, cursorHidden, self.clippingCursor);
+        }
+
+#endif
         if ([windowsBeingDragged count])
             ret = FALSE;
         else if (self.clippingCursor && [clipCursorHandler respondsToSelector:@selector(setCursorPosition:)])
@@ -1222,6 +1336,18 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
     }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* macOS merges the mouse's movements that wait in an application's queue into one event;
+     * while a program holds the pointer they are taken one by one. WINE_MOUSE_COALESCE=1 leaves
+     * the merging on, =0 turns it off for the whole session. */
+    static void set_mouse_coalescing_for_clipping(BOOL clipping)
+    {
+        const char *env = getenv("WINE_MOUSE_COALESCE");
+        BOOL merge = env ? atoi(env) != 0 : !clipping;
+        if ([NSEvent isMouseCoalescingEnabled] != merge) [NSEvent setMouseCoalescingEnabled:merge];
+    }
+
+#endif
     - (BOOL) startClippingCursor:(CGRect)rect
     {
         if (!clipCursorHandler) {
@@ -1237,6 +1363,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
         if (![clipCursorHandler startClippingCursor:rect])
             return FALSE;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+        set_mouse_coalescing_for_clipping(TRUE);
+#endif
+
         [self setCursorPosition:NSPointToCGPoint([self flippedMouseLocation:[NSEvent mouseLocation]])];
 
         [self updateWindowsForCursorClipping];
@@ -1251,6 +1381,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
         if (![clipCursorHandler stopClippingCursor])
             return FALSE;
+
+#if defined(__APPLE__) && defined(__aarch64__)
+        set_mouse_coalescing_for_clipping(FALSE);
+#endif
 
         lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
 
@@ -1359,6 +1493,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
         event->mouse_moved.raw_y = (int)rawRemainderY;
         rawRemainderX -= event->mouse_moved.raw_x;
         rawRemainderY -= event->mouse_moved.raw_y;
+        /* WINE_MOUSE_TRACE: when macOS made the event, when it got here, and what it carries */
+        if (mouse_trace_enabled())
+            fprintf(stderr, "wine: mouse in  %.3f ms (event %.3f ms) raw %d,%d\n",
+                    [[NSProcessInfo processInfo] systemUptime] * 1000.0, [anEvent timestamp] * 1000.0,
+                    event->mouse_moved.raw_x, event->mouse_moved.raw_y);
     }
 
 #endif
@@ -1396,6 +1535,66 @@ static NSString* WineLocalizedString(unsigned int stringID)
             macdrv_event* event;
             BOOL absolute;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+            if ([self pointerIsVirtual])
+            {
+                static int accelerated = -1;
+                double scale = retina_on ? 2 : 1;
+                CGRect desktop = CGRectNull;
+                const CGRect* rects;
+                NSUInteger count, i;
+
+                if (accelerated < 0)
+                {
+                    const char *env = getenv("WINE_MOUSE_ACCEL");
+                    accelerated = env && atoi(env);
+                }
+                event = macdrv_create_event(MOUSE_MOVED_RELATIVE, targetWindow);
+                set_raw_mouse_movement(anEvent, event);
+                if (accelerated)
+                {
+                    /* as far as macOS would have moved its pointer */
+                    mouseMoveDeltaX += [anEvent deltaX];
+                    mouseMoveDeltaY += [anEvent deltaY];
+                    event->mouse_moved.x = mouseMoveDeltaX * scale;
+                    event->mouse_moved.y = mouseMoveDeltaY * scale;
+                    mouseMoveDeltaX -= event->mouse_moved.x / scale;
+                    mouseMoveDeltaY -= event->mouse_moved.y / scale;
+                }
+                else
+                {
+                    /* a pixel for each count of the mouse, as Windows moves its pointer with
+                     * "enhance pointer precision" off: the same movement of the hand is the
+                     * same turn of the camera every time */
+                    event->mouse_moved.x = event->mouse_moved.raw_x;
+                    event->mouse_moved.y = event->mouse_moved.raw_y;
+                }
+                /* Wine keeps the pointer on the desktop; so does this copy of where it is */
+                [self primaryScreenHeight];
+                rects = [screenFrameCGRects bytes];
+                count = [screenFrameCGRects length] / sizeof(rects[0]);
+                for (i = 0; i < count; i++) desktop = CGRectUnion(desktop, rects[i]);
+                virtualPointerPos.x += event->mouse_moved.x / scale;
+                virtualPointerPos.y += event->mouse_moved.y / scale;
+                if (!CGRectIsNull(desktop))
+                {
+                    virtualPointerPos.x = fmax(CGRectGetMinX(desktop), fmin(CGRectGetMaxX(desktop) - 1, virtualPointerPos.x));
+                    virtualPointerPos.y = fmax(CGRectGetMinY(desktop), fmin(CGRectGetMaxY(desktop) - 1, virtualPointerPos.y));
+                }
+                if (event->mouse_moved.x || event->mouse_moved.y || event->mouse_moved.raw_x || event->mouse_moved.raw_y)
+                {
+                    event->mouse_moved.time_ms = [self ticksForEventTime:[anEvent timestamp]];
+                    event->mouse_moved.drag = drag;
+                    [targetWindow.queue postEvent:event];
+                }
+                macdrv_release_event(event);
+                lastTargetWindow = targetWindow;
+                lastSetCursorPositionTime = 0;
+                forceNextMouseMoveAbsolute = TRUE;      /* once the pointer is the system's again */
+                return;
+            }
+
+#endif
             // If we recently warped the cursor (other than in our cursor-clipping
             // event tap), discard mouse move events until we see an event which is
             // later than that time.
@@ -1638,6 +1837,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
             {
                 macdrv_event* event;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+                if ([self pointerIsVirtual]) pt = virtualPointerPos;   /* the system's pointer is not where Wine's is */
+#endif
                 pt = cgpoint_win_from_mac(pt);
 
                 event = macdrv_create_event(MOUSE_BUTTON, window);
@@ -1721,6 +1923,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 double x, y;
                 BOOL continuous = FALSE;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+                if ([self pointerIsVirtual]) pt = virtualPointerPos;   /* the system's pointer is not where Wine's is */
+#endif
                 pt = cgpoint_win_from_mac(pt);
 
                 event = macdrv_create_event(MOUSE_SCROLL, window);
@@ -2223,6 +2428,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
      */
     - (void)applicationDidBecomeActive:(NSNotification *)notification
     {
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (cursorHidden) [self enterVirtualPointer];
+
+#endif
         NSNumber* displayID;
         NSDictionary* modesToRealize = [latentDisplayModes autorelease];
 
@@ -2360,6 +2569,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (void)applicationWillResignActive:(NSNotification *)notification
     {
+#if defined(__APPLE__) && defined(__aarch64__)
+        [self leaveVirtualPointer];     /* the mouse is the system's while another program is in front */
+
+#endif
         [self adjustWindowLevels:NO];
     }
 
@@ -2577,6 +2790,11 @@ int macdrv_get_cursor_position(CGPoint *pos)
         NSPoint location = [NSEvent mouseLocation];
         location = [[WineApplicationController sharedController] flippedMouseLocation:location];
         *pos = cgpoint_win_from_mac(NSPointToCGPoint(location));
+#if defined(__APPLE__) && defined(__aarch64__)
+        /* while the pointer is Wine's alone, the system's is not where the program put it */
+        if ([[WineApplicationController sharedController] pointerIsVirtual])
+            *pos = cgpoint_win_from_mac(virtualPointerPos);
+#endif
     });
 
     return TRUE;
