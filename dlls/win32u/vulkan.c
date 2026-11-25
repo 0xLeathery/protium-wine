@@ -2011,24 +2011,128 @@ static void put_bgra8_unorm_first2( VkSurfaceFormat2KHR *formats, UINT32 count )
     put_bgra8_unorm_first_stride( &formats[0].surfaceFormat, count, sizeof(*formats) );
 }
 
+static BOOL is_hdr_color_space( VkColorSpaceKHR color_space )
+{
+    return color_space == VK_COLOR_SPACE_HDR10_ST2084_EXT || color_space == VK_COLOR_SPACE_HDR10_HLG_EXT ||
+           color_space == VK_COLOR_SPACE_DOLBYVISION_EXT;
+}
+
+/* KosmicKrisp lists the HDR10, HLG and Dolby Vision colour spaces for every surface, also on a screen
+ * that cannot show more than standard range; Windows' drivers list them only while the display is
+ * in HDR mode. Red Dead Redemption 2 offers and keeps its HDR output on an SDR monitor then. Unless
+ * the window's monitor shows HDR (macOS reports extended range headroom for it), those entries are
+ * left out. Returns the number of entries kept. */
+static UINT32 fixup_surface_formats_stride( HWND hwnd, VkSurfaceFormatKHR *formats, UINT32 count, size_t stride )
+{
+#define SURFACE_FORMAT(i) ((VkSurfaceFormatKHR *)((char *)formats + (i) * stride))
+    UINT32 i, kept = 0;
+
+    if (!monitor_hdr_enabled_from_window( hwnd ))
+    {
+        for (i = 0; i < count; i++)
+        {
+            if (is_hdr_color_space( SURFACE_FORMAT(i)->colorSpace )) continue;
+            if (kept != i) *SURFACE_FORMAT(kept) = *SURFACE_FORMAT(i);
+            kept++;
+        }
+        if (kept != count) TRACE( "left out %u HDR surface formats of %u\n", count - kept, count );
+        count = kept;
+    }
+    put_bgra8_unorm_first_stride( formats, count, stride );
+    return count;
+#undef SURFACE_FORMAT
+}
+
+static VkResult get_host_surface_formats( struct vulkan_physical_device *physical_device, struct surface *surface,
+                                          uint32_t *format_count, VkSurfaceFormatKHR *formats )
+{
+    struct vulkan_instance *instance = physical_device->instance;
+    VkSurfaceFormatKHR *host_formats;
+    uint32_t host_count, count;
+    VkResult res;
+
+    if ((res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
+                                                                surface->obj.host.surface, &host_count, NULL )))
+        return res;
+    if (!(host_formats = calloc( host_count ? host_count : 1, sizeof(*host_formats) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
+                                                           surface->obj.host.surface, &host_count, host_formats );
+    if (res && res != VK_INCOMPLETE)
+    {
+        free( host_formats );
+        return res;
+    }
+
+    count = fixup_surface_formats_stride( surface->hwnd, host_formats, host_count, sizeof(*host_formats) );
+    if (!formats) res = VK_SUCCESS;
+    else
+    {
+        res = *format_count < count ? VK_INCOMPLETE : VK_SUCCESS;
+        count = min( count, *format_count );
+        memcpy( formats, host_formats, count * sizeof(*formats) );
+    }
+    *format_count = count;
+    free( host_formats );
+    return res;
+}
+
+static VkResult get_host_surface_formats2( struct vulkan_physical_device *physical_device, struct surface *surface,
+                                           const VkPhysicalDeviceSurfaceInfo2KHR *surface_info_host,
+                                           uint32_t *format_count, VkSurfaceFormat2KHR *formats )
+{
+    struct vulkan_instance *instance = physical_device->instance;
+    VkSurfaceFormat2KHR *host_formats;
+    uint32_t i, host_count, count;
+    VkResult res;
+
+    /* An entry that chains structures of its own asks the host for them: pass it through. */
+    if (formats) for (i = 0; i < *format_count; i++)
+    {
+        if (!formats[i].pNext) continue;
+        res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
+                                                                surface_info_host, format_count, formats );
+        if (res == VK_SUCCESS || res == VK_INCOMPLETE) put_bgra8_unorm_first2( formats, *format_count );
+        return res;
+    }
+
+    if ((res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
+                                                                 surface_info_host, &host_count, NULL )))
+        return res;
+    if (!(host_formats = calloc( host_count ? host_count : 1, sizeof(*host_formats) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    for (i = 0; i < host_count; i++) host_formats[i].sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR;
+    res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
+                                                            surface_info_host, &host_count, host_formats );
+    if (res && res != VK_INCOMPLETE)
+    {
+        free( host_formats );
+        return res;
+    }
+
+    count = fixup_surface_formats_stride( surface->hwnd, &host_formats[0].surfaceFormat, host_count, sizeof(*host_formats) );
+    if (!formats) res = VK_SUCCESS;
+    else
+    {
+        res = *format_count < count ? VK_INCOMPLETE : VK_SUCCESS;
+        count = min( count, *format_count );
+        for (i = 0; i < count; i++) formats[i].surfaceFormat = host_formats[i].surfaceFormat;
+    }
+    *format_count = count;
+    free( host_formats );
+    return res;
+}
+
 #endif
 static VkResult win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice client_physical_device, VkSurfaceKHR client_surface,
                                                              uint32_t *format_count, VkSurfaceFormatKHR *formats )
 {
     struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
     struct surface *surface = surface_from_handle( client_surface );
-    struct vulkan_instance *instance = physical_device->instance;
 
 #ifdef __APPLE__
-    {
-        VkResult res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
-                                                                        surface->obj.host.surface, format_count, formats );
-
-        if (formats && (res == VK_SUCCESS || res == VK_INCOMPLETE))
-            put_bgra8_unorm_first_stride( formats, *format_count, sizeof(*formats) );
-        return res;
-    }
+    return get_host_surface_formats( physical_device, surface, format_count, formats );
 #else
+    struct vulkan_instance *instance = physical_device->instance;
+
     return instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
                                                                 surface->obj.host.surface, format_count, formats );
 #endif
@@ -2065,10 +2169,7 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice c
     surface_info_host.surface = surface->obj.host.surface;
 
 #ifdef __APPLE__
-    res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
-                                                            &surface_info_host, format_count, formats );
-    if (formats && (res == VK_SUCCESS || res == VK_INCOMPLETE)) put_bgra8_unorm_first2( formats, *format_count );
-    return res;
+    return get_host_surface_formats2( physical_device, surface, &surface_info_host, format_count, formats );
 #else
     return instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
                                                                  &surface_info_host, format_count, formats );
@@ -2678,6 +2779,12 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         return res;
     }
 
+#ifdef __APPLE__
+    WARN( "window %p swapchain: format %u, colour space %#x, %ux%u, %u images, present mode %u, host format %u at %ux%u\n",
+          surface->hwnd, create_info->imageFormat, create_info->imageColorSpace, create_info->imageExtent.width,
+          create_info->imageExtent.height, create_info->minImageCount, create_info->presentMode,
+          create_info_host.imageFormat, create_info_host.imageExtent.width, create_info_host.imageExtent.height );
+#endif
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
     swapchain->extents = create_info->imageExtent;

@@ -192,6 +192,9 @@ extern RECT rect_thread_to_win_dpi( HWND hwnd, RECT rect );
 extern HMONITOR monitor_from_window( HWND hwnd, UINT flags, UINT dpi );
 extern MONITORINFO monitor_info_from_rect( RECT rect, UINT dpi );
 extern MONITORINFO monitor_info_from_window( HWND hwnd, UINT flags );
+#ifdef __APPLE__
+extern BOOL monitor_hdr_enabled_from_window( HWND hwnd );
+#endif
 extern UINT monitor_dpi_from_rect( RECT rect, UINT dpi, UINT *raw_dpi );
 extern BOOL update_display_cache( BOOL force );
 extern void reset_monitor_update_serial(void);

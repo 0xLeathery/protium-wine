@@ -4975,6 +4975,21 @@ HMONITOR monitor_from_window( HWND hwnd, UINT flags, UINT dpi )
     return monitor_from_rect( &rect, flags, dpi );
 }
 
+#ifdef __APPLE__
+/* whether the monitor nearest to a window shows high dynamic range content */
+BOOL monitor_hdr_enabled_from_window( HWND hwnd )
+{
+    HMONITOR handle = monitor_from_window( hwnd, MONITOR_DEFAULTTONEAREST, get_thread_dpi() );
+    struct monitor *monitor;
+    BOOL ret = FALSE;
+
+    if (!lock_display_devices( FALSE )) return FALSE;
+    if ((monitor = get_monitor_from_handle( handle ))) ret = monitor->hdr_enabled;
+    unlock_display_devices();
+    return ret;
+}
+#endif
+
 MONITORINFO monitor_info_from_window( HWND hwnd, UINT flags )
 {
     MONITORINFO info = {.cbSize = sizeof(info)};
