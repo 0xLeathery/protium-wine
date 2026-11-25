@@ -223,6 +223,11 @@ extern void *raw_device_create(const struct raw_device_vtbl *vtbl, SIZE_T size);
 extern void *hid_device_create(const struct hid_device_vtbl *vtbl, SIZE_T size);
 
 extern NTSTATUS sdl_bus_init(void *);
+#if defined(__APPLE__) && defined(__aarch64__)
+/* Whether the SDL bus is up. It is started before the IOHID bus and has finished starting by
+ * then, so the IOHID bus can tell whether SDL brings the game controllers. */
+extern BOOL sdl_bus_available;
+#endif
 extern NTSTATUS sdl_bus_wait(void *);
 extern NTSTATUS sdl_bus_stop(void *);
 

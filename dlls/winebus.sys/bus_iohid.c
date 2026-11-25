@@ -307,9 +307,10 @@ static void handle_DeviceMatchingCallback(void *context, IOReturn result, void *
     }
 #if defined(__APPLE__) && defined(__aarch64__)
     /* winebus takes a raw HID gamepad or joystick only where it prefers raw HID for it, and
-     * otherwise expects SDL or evdev to bring it. This build has neither, so IOHID is where game
-     * controllers come from, as they did before winebus told the two apart. */
-    desc.is_hidraw = FALSE;
+     * otherwise expects SDL or evdev to bring it. When SDL is not there (the library is missing
+     * or would not start), IOHID is where game controllers come from, as they did before
+     * winebus told the two apart. */
+    if (!sdl_bus_available) desc.is_hidraw = FALSE;
 #endif
 
     if (IOHIDDeviceOpen(IOHIDDevice, 0) != kIOReturnSuccess)

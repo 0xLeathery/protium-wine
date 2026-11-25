@@ -1107,6 +1107,17 @@ NTSTATUS sdl_bus_init(void *args)
 
     options = (struct bus_options *)args;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    {
+        /* a way back to the controllers as IOHID alone brings them, for a game SDL does worse by */
+        const char *off = getenv("PROTON_NO_SDL");
+        if (off && off[0] == '1')
+        {
+            WARN("SDL is turned off by PROTON_NO_SDL\n");
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+#endif
     if (!(sdl_handle = dlopen(SONAME_LIBSDL2, RTLD_NOW)))
     {
         WARN("could not load %s\n", SONAME_LIBSDL2);
@@ -1218,6 +1229,9 @@ NTSTATUS sdl_bus_init(void *args)
         }
     }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    sdl_bus_available = TRUE;
+#endif
     return STATUS_SUCCESS;
 
 failed:

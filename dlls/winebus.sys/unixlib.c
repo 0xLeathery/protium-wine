@@ -300,6 +300,10 @@ static NTSTATUS unix_device_set_feature_report(void *args)
     return STATUS_SUCCESS;
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+BOOL sdl_bus_available = FALSE;
+
+#endif
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     sdl_bus_init,
