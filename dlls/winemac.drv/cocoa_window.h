@@ -83,7 +83,11 @@
     BOOL ignore_windowResize;
     BOOL fakingClose;
 
+#ifdef __APPLE__
     CALayer* contentViewMaskLayer;
+#else
+    CAShapeLayer* contentViewMaskLayer;
+#endif
 }
 
 @property (retain, readonly, nonatomic) WineEventQueue* queue;

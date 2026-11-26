@@ -414,7 +414,11 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
 @property (readonly, copy, nonatomic) NSArray* childWineWindows;
 
+#ifdef __APPLE__
 @property (retain, nonatomic) CALayer* contentViewMaskLayer;
+#else
+@property (retain, nonatomic) CAShapeLayer* contentViewMaskLayer;
+#endif
 
     - (void) setShape:(CGPathRef)newShape;
 
@@ -2771,6 +2775,7 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 
     - (void) setMask:(CGRect)rect
     {
+#ifdef __APPLE__
         /* Draw black bars to cover every part of the window except for 'rect', which is in
          * the window's own coordinates as Wine counts them: from its top left corner, in pixels.
          * Intended for use on a window covering the full screen.
@@ -2815,6 +2820,51 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         [view.layer addSublayer:container];
         [CATransaction commit];
         self.contentViewMaskLayer = container;
+#else
+        /* Draw black bars to cover every part of the window except for 'rect'.
+         * Intended for use on a window covering the full screen.
+         */
+        if (self.contentViewMaskLayer)
+        {
+            [self.contentViewMaskLayer removeFromSuperlayer];
+            self.contentViewMaskLayer = nil;
+        }
+
+        if (CGRectIsEmpty(rect))
+            return;
+
+        CAShapeLayer *shapeLayer = [CAShapeLayer layer];
+        shapeLayer.bounds = self.contentView.layer.bounds;
+        shapeLayer.position = self.contentView.layer.position;
+        shapeLayer.geometryFlipped = self.contentView.layer.geometryFlipped;
+        shapeLayer.anchorPoint = self.contentView.layer.anchorPoint;
+        shapeLayer.fillColor = CGColorGetConstantColor(kCGColorBlack);
+
+        CGMutablePathRef path = CGPathCreateMutable();
+        /* left/right */
+        if (rect.origin.x > 0.0)
+            CGPathAddRect(path, NULL, CGRectMake(0, 0, rect.origin.x, shapeLayer.bounds.size.height));
+        if (rect.origin.x + rect.size.width < shapeLayer.bounds.size.width)
+            CGPathAddRect(path, NULL, CGRectMake(rect.origin.x + rect.size.width,
+                                                 0,
+                                                 shapeLayer.bounds.size.width - (rect.origin.x + rect.size.width),
+                                                 shapeLayer.bounds.size.height));
+
+        /* top/bottom */
+        if (rect.origin.y > 0.0)
+            CGPathAddRect(path, NULL, CGRectMake(0, 0, shapeLayer.bounds.size.width, rect.origin.y));
+        if (rect.origin.y + rect.size.height < shapeLayer.bounds.size.height)
+            CGPathAddRect(path, NULL, CGRectMake(0,
+                                                 rect.origin.y + rect.size.height,
+                                                 shapeLayer.bounds.size.width,
+                                                 shapeLayer.bounds.size.height - (rect.origin.y + rect.size.height)));
+
+        shapeLayer.path = path;
+        CGPathRelease(path);
+
+        [self.contentView.layer addSublayer:shapeLayer];
+        self.contentViewMaskLayer = shapeLayer;
+#endif
     }
 
 

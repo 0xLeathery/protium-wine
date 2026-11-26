@@ -218,9 +218,16 @@ static INT macdrv_GetDeviceCaps(PHYSDEV dev, INT cap)
     default:
         pthread_mutex_unlock(&device_data_mutex);
         dev = GET_NEXT_PHYSDEV( dev, pGetDeviceCaps );
+#ifdef __APPLE__
         /* HORZRES and VERTRES come from win32u as the display's size, which is in pixels
          * already in Retina mode: doubling it here reported twice the screen */
         return dev->funcs->pGetDeviceCaps( dev, cap );
+#else
+        ret = dev->funcs->pGetDeviceCaps( dev, cap );
+        if ((cap == HORZRES || cap == VERTRES) && retina_on)
+            ret *= 2;
+        return ret;
+#endif
     }
 
     TRACE("cap %d -> %d\n", cap, ret);

@@ -1676,8 +1676,12 @@ BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *styl
 void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                              const struct window_rects *new_rects, struct window_surface *surface)
 {
+#ifdef __APPLE__
     /* a yes or no: data->fullscreen is a field of one bit, and the flag is the top one */
     BOOL fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
+#else
+    BOOL fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+#endif
     struct macdrv_thread_data *thread_data;
     struct macdrv_win_data *data;
     unsigned int new_style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
@@ -1732,6 +1736,7 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
 
     if (fullscreen || fullscreen != data->fullscreen)
     {
+#ifdef __APPLE__
         /* the part of the window the picture is in, counted from the window's own corner: the
          * rects are places on the desktop, and the bars are drawn inside the window */
         CGRect rect = CGRectZero;
@@ -1741,6 +1746,9 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
             OffsetRect(&picture, -data->rects.visible.left, -data->rects.visible.top);
             rect = cgrect_from_rect(picture);
         }
+#else
+        CGRect rect = (fullscreen && !EqualRect(&data->rects.window, &data->rects.visible)) ? cgrect_from_rect(data->rects.window) : CGRectZero;
+#endif
         macdrv_set_window_mask(data->cocoa_window, rect);
         data->fullscreen = fullscreen;
     }
