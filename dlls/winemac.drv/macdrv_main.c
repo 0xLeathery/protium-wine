@@ -293,9 +293,9 @@ static bool main_display_is_hidpi(void)
     CGDisplayModeRelease(mode);
     return ret;
 }
+
+
 #endif
-
-
 static void setup_options(void)
 {
     static const WCHAR macdriverW[] = {'\\','M','a','c',' ','D','r','i','v','e','r',0};

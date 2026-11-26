@@ -1365,8 +1365,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
 #if defined(__APPLE__) && defined(__aarch64__)
         set_mouse_coalescing_for_clipping(TRUE);
-#endif
 
+#endif
         [self setCursorPosition:NSPointToCGPoint([self flippedMouseLocation:[NSEvent mouseLocation]])];
 
         [self updateWindowsForCursorClipping];
@@ -1384,8 +1384,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
 #if defined(__APPLE__) && defined(__aarch64__)
         set_mouse_coalescing_for_clipping(FALSE);
-#endif
 
+#endif
         lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
 
         [self updateWindowsForCursorClipping];
