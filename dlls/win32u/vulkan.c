@@ -2990,9 +2990,12 @@ static void say_frame_stats(void)
 
 static void note_frame(void)
 {
-    UINT64 now = stats_now_ns();
+    UINT64 now;
 
+    /* the clock is read with the lock held: read before it, a thread that got the lock after
+     * another one that read later would count a frame of now - last_ns < 0, that is 584 years */
     pthread_mutex_lock( &frame_stats_lock );
+    now = stats_now_ns();
     if (frame_stats.last_ns)
     {
         UINT64 ns = now - frame_stats.last_ns;
