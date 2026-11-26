@@ -4988,8 +4988,8 @@ BOOL monitor_hdr_enabled_from_window( HWND hwnd )
     unlock_display_devices();
     return ret;
 }
-#endif
 
+#endif
 MONITORINFO monitor_info_from_window( HWND hwnd, UINT flags )
 {
     MONITORINFO info = {.cbSize = sizeof(info)};

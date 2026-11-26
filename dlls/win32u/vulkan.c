@@ -2130,8 +2130,8 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice cl
 {
     struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
     struct surface *surface = surface_from_handle( client_surface );
-
 #ifdef __APPLE__
+
     return get_host_surface_formats( physical_device, surface, format_count, formats );
 #else
     struct vulkan_instance *instance = physical_device->instance;
