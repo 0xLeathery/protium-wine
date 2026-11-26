@@ -103,6 +103,87 @@ struct coreaudio_stream
 };
 
 static const REFERENCE_TIME def_period = 100000;
+#ifdef __APPLE__
+#include <time.h>
+
+/* The audio line, with WINE_PROCESS_STATS=<seconds> as for ntdll's process line: how often the
+ * render callbacks of this process's streams found less to play than Core Audio asked for, how much
+ * silence went in for it, and how often a callback found the stream's lock taken, written once in
+ * each period of the line in which any of that happened, at the same moments as the process line.
+ * The callbacks run on Core Audio's threads, which must not log (see unix_create_stream): they only
+ * count; a stream's timer loop, a Wine thread, writes the line. */
+static int audio_stats_interval = -1;
+static LONG64 audio_stats_callbacks, audio_stats_short, audio_stats_empty, audio_stats_silence_us, audio_stats_busy;
+static LONG64 audio_stats_window = -1;
+static time_t audio_stats_since;
+
+/* on Core Audio's thread, the lock held: one callback while playing */
+static void audio_stats_note( UINT32 asked, UINT32 copied, UINT32 rate )
+{
+    __atomic_add_fetch( &audio_stats_callbacks, 1, __ATOMIC_RELAXED );
+    if (copied >= asked) return;
+    __atomic_add_fetch( copied ? &audio_stats_short : &audio_stats_empty, 1, __ATOMIC_RELAXED );
+    if (rate) __atomic_add_fetch( &audio_stats_silence_us, (LONG64)(asked - copied) * 1000000 / rate, __ATOMIC_RELAXED );
+}
+
+static const char *audio_stats_program(void)
+{
+    static char name[64];
+    const WCHAR *path, *p;
+    UINT i = 0;
+
+    if (name[0]) return name;
+    path = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+    if (path)
+    {
+        for (p = path; *p; p++) if (*p == '\\' || *p == '/') path = p + 1;
+        for (p = path; *p && i < sizeof(name) - 1; p++)
+            name[i++] = *p >= 0x80 ? '?' : (*p == ',' || *p == '(' || *p == ')') ? '_' : *p;
+    }
+    if (!i) name[i++] = '?';
+    name[i] = 0;
+    return name;
+}
+
+/* on a stream's timer loop, every period of the stream */
+static void audio_stats_tick(void)
+{
+    LONG64 window, seen, callbacks, shorts, empty, silence_us, busy;
+    time_t now = time( NULL );
+    char clock_text[16] = "";
+    struct tm tm;
+
+    if (audio_stats_interval < 0)
+    {
+        const char *env = getenv( "WINE_PROCESS_STATS" );
+        audio_stats_interval = env ? max( atoi( env ), 0 ) : 0;
+    }
+    if (!audio_stats_interval) return;
+    window = now / audio_stats_interval;
+    seen = __atomic_load_n( &audio_stats_window, __ATOMIC_RELAXED );
+    if (seen == window) return;
+    if (!__atomic_compare_exchange_n( &audio_stats_window, &seen, window, FALSE, __ATOMIC_RELAXED, __ATOMIC_RELAXED ))
+        return;
+    if (seen == -1)
+    {
+        audio_stats_since = now;
+        return;
+    }
+    callbacks = __atomic_exchange_n( &audio_stats_callbacks, 0, __ATOMIC_RELAXED );
+    shorts = __atomic_exchange_n( &audio_stats_short, 0, __ATOMIC_RELAXED );
+    empty = __atomic_exchange_n( &audio_stats_empty, 0, __ATOMIC_RELAXED );
+    silence_us = __atomic_exchange_n( &audio_stats_silence_us, 0, __ATOMIC_RELAXED );
+    busy = __atomic_exchange_n( &audio_stats_busy, 0, __ATOMIC_RELAXED );
+    if ((shorts || empty || busy) && localtime_r( &now, &tm )) strftime( clock_text, sizeof(clock_text), "%H:%M:%S", &tm );
+    if (shorts || empty || busy)
+        MESSAGE( "Audio: the last %lld s (%s, pid %d, %s): callbacks %lld, short %lld, empty %lld, silence %lld ms, "
+                 "lock busy %lld\n", (long long)(now - audio_stats_since), audio_stats_program(), (int)getpid(),
+                 clock_text, (long long)callbacks, (long long)shorts, (long long)empty,
+                 (long long)(silence_us / 1000), (long long)busy );
+    audio_stats_since = now;
+}
+
+#endif
 static const REFERENCE_TIME min_period = 50000;
 
 static ULONG_PTR zero_bits = 0;
@@ -396,12 +477,23 @@ static OSStatus ca_render_cb(void *user, AudioUnitRenderActionFlags *flags,
     struct coreaudio_stream *stream = user;
     UINT32 to_copy_bytes, to_copy_frames, chunk_bytes, lcl_offs_bytes;
 
+#ifdef __APPLE__
+    if (!os_unfair_lock_trylock(&stream->lock))
+    {
+        __atomic_add_fetch( &audio_stats_busy, 1, __ATOMIC_RELAXED );
+        os_unfair_lock_lock(&stream->lock);
+    }
+#else
     os_unfair_lock_lock(&stream->lock);
+#endif
 
     if(stream->playing){
         lcl_offs_bytes = stream->lcl_offs_frames * stream->fmt->nBlockAlign;
         to_copy_frames = min(nframes, stream->held_frames);
         to_copy_bytes = to_copy_frames * stream->fmt->nBlockAlign;
+#ifdef __APPLE__
+        audio_stats_note( nframes, to_copy_frames, stream->fmt->nSamplesPerSec );
+#endif
 
         chunk_bytes = (stream->bufsize_frames - stream->lcl_offs_frames) * stream->fmt->nBlockAlign;
 
@@ -1547,6 +1639,9 @@ static NTSTATUS unix_timer_loop(void *args)
     while(!stream->please_quit){
         NtSetEvent(stream->event, NULL);
         NtDelayExecution(FALSE, &delay);
+#ifdef __APPLE__
+        audio_stats_tick();
+#endif
         NtQueryPerformanceCounter(&last, NULL);
 
         adjust = next.QuadPart - last.QuadPart;
