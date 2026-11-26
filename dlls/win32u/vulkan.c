@@ -27,6 +27,9 @@
 #include <math.h>
 #include <dlfcn.h>
 #include <pthread.h>
+#ifdef __APPLE__
+#include <time.h>
+#endif
 #include <unistd.h>
 
 #include "ntstatus.h"
@@ -2816,6 +2819,10 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     return VK_SUCCESS;
 }
 
+#ifdef __APPLE__
+static void note_swapchain_gone(void);
+
+#endif
 void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
                                    const VkAllocationCallbacks *allocator )
 {
@@ -2825,6 +2832,9 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
 
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
+#ifdef __APPLE__
+    note_swapchain_gone();
+#endif
 
     if (swapchain->fshack_dpi)
     {
@@ -2854,6 +2864,170 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     free( swapchain );
 }
 
+#ifdef __APPLE__
+/* How long a Vulkan program's frames take (from one present to the next), and how long its
+ * threads spend in the host driver's submit, acquire and present calls, said in the log every half
+ * minute, each time for the whole run so far, as DXMT does for Direct3D 11 programs
+ * (macos/patches/dxmt/0010). The lines carry the program's name: a game's launcher often draws
+ * with Direct3D while the game draws with Vulkan, and DXMT's lines do not say whose they are.
+ * Two clock reads and a few additions per call. */
+#define FRAME_STEPS 400 /* of half a millisecond, up to 200 ms */
+#define SLOW_FRAMES 24
+
+static pthread_mutex_t frame_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct
+{
+    UINT steps[FRAME_STEPS];
+    UINT64 count, slow, last_ns, said_ns, total_ns, worst_ns;
+    UINT64 window_frames;
+    UINT window_slow_count;
+    struct { float at_s, ms; } window_slow[SLOW_FRAMES];
+} frame_stats;
+
+/* added up by any thread, said and cleared with the half-minute lines */
+static struct
+{
+    UINT64 submits, buffers, submit_ns, acquires, acquire_ns, present_ns, driver_present_ns;
+} call_stats;
+
+static UINT64 stats_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (UINT64)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static void stats_add( UINT64 *counter, UINT64 value )
+{
+    __atomic_fetch_add( counter, value, __ATOMIC_RELAXED );
+}
+
+static UINT64 stats_take( UINT64 *counter )
+{
+    return __atomic_exchange_n( counter, 0, __ATOMIC_RELAXED );
+}
+
+static const char *stats_program_name(void)
+{
+    static char name[64];
+    const WCHAR *path, *p;
+    UINT i = 0;
+
+    if (name[0]) return name;
+    path = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+    if (path)
+    {
+        for (p = path; *p; p++) if (*p == '\\' || *p == '/') path = p + 1;
+        for (p = path; *p && i < sizeof(name) - 1; p++) name[i++] = *p < 0x80 ? *p : '?';
+    }
+    if (!i) name[i++] = '?';
+    name[i] = 0;
+    return name;
+}
+
+/* the frame time that the given share of the frames stayed under, in milliseconds */
+static double frame_time_at( double share )
+{
+    UINT64 wanted = (UINT64)(frame_stats.count * share), seen = 0;
+    UINT i;
+
+    for (i = 0; i < FRAME_STEPS; i++)
+    {
+        seen += frame_stats.steps[i];
+        if (seen > wanted) return i == FRAME_STEPS - 1 ? frame_stats.worst_ns / 1e6 : (i + 1) / 2.0;
+    }
+    return frame_stats.worst_ns / 1e6;
+}
+
+/* frame_stats_lock held */
+static void say_frame_stats(void)
+{
+    const char *name = stats_program_name();
+    double frames = frame_stats.window_frames, submits, buffers, submit_ms, acquires, acquire_ms, present_ms, driver_ms;
+    char text[800];
+    int used;
+    UINT i;
+
+    MESSAGE( "Vulkan: frame times (%s): %llu frames in %llu s, median %.1f ms, 95%% %.1f ms, 99%% %.1f ms, "
+             "worst %.1f ms, %llu over 50 ms\n", name, (unsigned long long)frame_stats.count,
+             (unsigned long long)(frame_stats.total_ns / 1000000000), frame_time_at( 0.50 ), frame_time_at( 0.95 ),
+             frame_time_at( 0.99 ), frame_stats.worst_ns / 1e6, (unsigned long long)frame_stats.slow );
+
+    used = snprintf( text, sizeof(text), "Vulkan: the last 30 s (%s): %llu frames, %u over 50 ms", name,
+                     (unsigned long long)frame_stats.window_frames, frame_stats.window_slow_count );
+    for (i = 0; i < min( frame_stats.window_slow_count, SLOW_FRAMES ) && used < (int)sizeof(text) - 32; i++)
+        used += snprintf( text + used, sizeof(text) - used, "%s%.1f s (%.0f ms)", i ? ", " : ": at ",
+                          frame_stats.window_slow[i].at_s, frame_stats.window_slow[i].ms );
+    MESSAGE( "%s\n", text );
+
+    submits = stats_take( &call_stats.submits );
+    buffers = stats_take( &call_stats.buffers );
+    submit_ms = stats_take( &call_stats.submit_ns ) / 1e6;
+    acquires = stats_take( &call_stats.acquires );
+    acquire_ms = stats_take( &call_stats.acquire_ns ) / 1e6;
+    present_ms = stats_take( &call_stats.present_ns ) / 1e6;
+    driver_ms = stats_take( &call_stats.driver_present_ns ) / 1e6;
+    if (frames >= 1)
+        MESSAGE( "Vulkan: a frame of the last 30 s (%s): %.1f submits of %.1f command buffers, %.2f ms in the driver's "
+                 "submit, %.1f acquires %.2f ms, present %.2f ms (the driver's %.2f ms)\n", name, submits / frames,
+                 buffers / frames, submit_ms / frames, acquires / frames, acquire_ms / frames, present_ms / frames,
+                 driver_ms / frames );
+}
+
+static void note_frame(void)
+{
+    UINT64 now = stats_now_ns();
+
+    pthread_mutex_lock( &frame_stats_lock );
+    if (frame_stats.last_ns)
+    {
+        UINT64 ns = now - frame_stats.last_ns;
+
+        frame_stats.steps[min( ns / 500000, FRAME_STEPS - 1 )]++;
+        frame_stats.count++;
+        frame_stats.total_ns += ns;
+        frame_stats.window_frames++;
+        if (ns > 50000000)
+        {
+            frame_stats.slow++;
+            if (frame_stats.window_slow_count < SLOW_FRAMES)
+            {
+                frame_stats.window_slow[frame_stats.window_slow_count].at_s = (now - frame_stats.said_ns) / 1e9;
+                frame_stats.window_slow[frame_stats.window_slow_count].ms = ns / 1e6;
+            }
+            frame_stats.window_slow_count++;
+        }
+        if (ns > frame_stats.worst_ns) frame_stats.worst_ns = ns;
+    }
+    if (!frame_stats.said_ns) frame_stats.said_ns = now;
+    frame_stats.last_ns = now;
+    if (now - frame_stats.said_ns >= 30000000000ull)
+    {
+        frame_stats.said_ns = now;
+        say_frame_stats();
+        frame_stats.window_frames = 0;
+        frame_stats.window_slow_count = 0;
+    }
+    pthread_mutex_unlock( &frame_stats_lock );
+}
+
+/* The run's lines also when the game ends from its own menu; the time until the next swapchain
+ * shows its first picture is no frame's. */
+static void note_swapchain_gone(void)
+{
+    pthread_mutex_lock( &frame_stats_lock );
+    if (frame_stats.count)
+    {
+        say_frame_stats();
+        frame_stats.window_frames = 0;
+        frame_stats.window_slow_count = 0;
+        frame_stats.said_ns = stats_now_ns();
+    }
+    frame_stats.last_ns = 0;
+    pthread_mutex_unlock( &frame_stats_lock );
+}
+
+#endif
 static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkAcquireNextImageInfoKHR *acquire_info,
                                                uint32_t *image_index )
 {
@@ -2869,7 +3043,16 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     acquire_info_host.swapchain = swapchain->obj.host.swapchain;
     acquire_info_host.semaphore = semaphore ? semaphore->host.semaphore : 0;
     acquire_info_host.fence = fence ? fence->host.fence : 0;
+#ifdef __APPLE__
+    {
+        UINT64 start = stats_now_ns();
+        res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
+        stats_add( &call_stats.acquire_ns, stats_now_ns() - start );
+        stats_add( &call_stats.acquires, 1 );
+    }
+#else
     res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
+#endif
 
     if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
     {
@@ -2899,9 +3082,16 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     RECT client_rect;
     VkResult res;
 
+#ifdef __APPLE__
+    UINT64 start = stats_now_ns();
+#endif
     res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
+#ifdef __APPLE__
+    stats_add( &call_stats.acquire_ns, stats_now_ns() - start );
+    stats_add( &call_stats.acquires, 1 );
+#endif
 
     if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
     {
@@ -3101,6 +3291,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct mempool pool = {0};
     uint32_t blit_count = 0;
     VkSemaphore blit_sema;
+#ifdef __APPLE__
+    UINT64 present_start = stats_now_ns(), driver_start;
+#endif
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
 
@@ -3179,7 +3372,13 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     }
 
     pthread_mutex_lock( &lock );
+#ifdef __APPLE__
+    driver_start = stats_now_ns();
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    stats_add( &call_stats.driver_present_ns, stats_now_ns() - driver_start );
+#else
+    res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+#endif
     pthread_mutex_unlock( &lock );
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
@@ -3230,6 +3429,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
     }
 
+#ifdef __APPLE__
+    stats_add( &call_stats.present_ns, stats_now_ns() - present_start );
+    note_frame();
+
+#endif
 failed:
     mem_free( &pool );
     return res;
@@ -3504,7 +3708,18 @@ static VkResult win32u_vkQueueSubmit( VkQueue client_queue, uint32_t count, cons
         }
     }
 
+#ifdef __APPLE__
+    {
+        UINT64 start = stats_now_ns(), buffers = 0;
+        res = device->p_vkQueueSubmit( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
+        stats_add( &call_stats.submit_ns, stats_now_ns() - start );
+        for (uint32_t i = 0; i < count; i++) buffers += submits[i].commandBufferCount;
+        stats_add( &call_stats.buffers, buffers );
+        stats_add( &call_stats.submits, 1 );
+    }
+#else
     res = device->p_vkQueueSubmit( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
+#endif
 
 failed:
     mem_free( &pool );
@@ -3567,7 +3782,18 @@ static VkResult queue_submit( struct vulkan_queue *queue, uint32_t count, const 
         }
     }
 
+#ifdef __APPLE__
+    {
+        UINT64 start = stats_now_ns(), buffers = 0;
+        res = p_vkQueueSubmit2( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
+        stats_add( &call_stats.submit_ns, stats_now_ns() - start );
+        for (uint32_t i = 0; i < count; i++) buffers += submits[i].commandBufferInfoCount;
+        stats_add( &call_stats.buffers, buffers );
+        stats_add( &call_stats.submits, 1 );
+    }
+#else
     res = p_vkQueueSubmit2( queue->host.queue, count, submits, fence ? fence->host.fence : 0 );
+#endif
 
 failed:
     mem_free( &pool );
