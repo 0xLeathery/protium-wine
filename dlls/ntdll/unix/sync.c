@@ -2435,7 +2435,15 @@ NTSTATUS WINAPI NtYieldExecution(void)
 
     ret = getrusage( RUSAGE_THREAD, &u1 );
 #endif
+#ifdef __APPLE__
+    {
+        UINT64 start = process_stats_clock();
+        sched_yield();
+        process_stats_note( PROCESS_STATS_YIELD, start );
+    }
+#else
     sched_yield();
+#endif
 #ifdef RUSAGE_THREAD
     if (!ret) ret = getrusage( RUSAGE_THREAD, &u2 );
     if (!ret && u1.ru_nvcsw == u2.ru_nvcsw && u1.ru_nivcsw == u2.ru_nivcsw) return STATUS_NO_YIELD_PERFORMED;
@@ -2478,6 +2486,9 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
     {
         LARGE_INTEGER now;
         timeout_t when, diff;
+#ifdef __APPLE__
+        UINT64 sleep_start;
+#endif
 
         if ((when = timeout->QuadPart) < 0)
         {
@@ -2494,6 +2505,7 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
          * later: one Sleep(1) in a hundred took 10 ms. The sleep gives the processor up
          * anyway. */
         if (!when) return NtYieldExecution();
+        sleep_start = process_stats_clock();
 
 #else
         status = NtYieldExecution();
@@ -2536,6 +2548,9 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
             if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
 #endif
         }
+#ifdef __APPLE__
+        process_stats_note( PROCESS_STATS_SLEEP, sleep_start );
+#endif
     }
     return STATUS_SUCCESS;
 }
@@ -3683,6 +3698,9 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
         LONG *futex = &entry->futex;
         ULONGLONG end;
         int ret;
+#ifdef __APPLE__
+        UINT64 start = process_stats_clock();
+#endif
 
         if (timeout)
         {
@@ -3709,12 +3727,23 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
             if (!timeout || timeout->QuadPart)
                 waited = TRUE;
 
+#ifdef __APPLE__
+            if (ret == -1 && errno == ETIMEDOUT)
+            {
+                process_stats_note( PROCESS_STATS_ADDRESS, start );
+                return STATUS_TIMEOUT;
+            }
+#else
             if (ret == -1 && errno == ETIMEDOUT) return STATUS_TIMEOUT;
+#endif
         }
 
         if (alert_simulate_sched_quantum && waited)
             usleep(0);
 
+#ifdef __APPLE__
+        process_stats_note( PROCESS_STATS_ADDRESS, start );
+#endif
         return STATUS_ALERTED;
     }
 #elif defined(HAVE_KQUEUE)

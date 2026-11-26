@@ -255,6 +255,13 @@ extern int wine_server_receive_fd( obj_handle_t *handle );
 extern void process_exit_wrapper( int status ) DECLSPEC_NORETURN;
 #ifdef __APPLE__
 extern void process_stats_exit(void);
+/* the process line's counters (server.c): process_stats_clock() is 0 while the line is off, and
+ * process_stats_note() then does nothing */
+enum process_stats_kind { PROCESS_STATS_SERVER_WAIT, PROCESS_STATS_FSYNC, PROCESS_STATS_ADDRESS,
+                          PROCESS_STATS_SLEEP, PROCESS_STATS_YIELD, PROCESS_STATS_KINDS };
+extern UINT64 process_stats_clock(void);
+extern void process_stats_note( enum process_stats_kind kind, UINT64 start );
+extern void process_stats_request( int type, const char *name, UINT64 start );
 #endif
 extern size_t server_init_process(void);
 extern void server_init_process_done(void);

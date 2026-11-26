@@ -297,6 +297,11 @@ unsigned int server_call_unlocked( void *req_ptr )
 {
     struct __server_request_info * const req = req_ptr;
     unsigned int ret;
+#ifdef __APPLE__
+    /* the type before the reply overwrites it */
+    int type = req->u.req.request_header.req;
+    UINT64 start = process_stats_clock();
+#endif
 
     FTRACE_BLOCK_START("req %s", req->name)
     TRACE_(client)("%s start\n", req->name); \
@@ -304,6 +309,9 @@ unsigned int server_call_unlocked( void *req_ptr )
         ret = wait_reply( req );
     TRACE_(client)("%s end\n", req->name);
     FTRACE_BLOCK_END()
+#ifdef __APPLE__
+    process_stats_request( type, req->name, start );
+#endif
     return ret;
 }
 
@@ -788,7 +796,15 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
         if (signaled) break;
 
         FTRACE_BLOCK_START("select_reply")
+#ifdef __APPLE__
+        {
+            UINT64 start = process_stats_clock();
+            ret = wait_select_reply( &cookie );
+            process_stats_note( PROCESS_STATS_SERVER_WAIT, start );
+        }
+#else
         ret = wait_select_reply( &cookie );
+#endif
         FTRACE_BLOCK_END()
     }
     while (ret == STATUS_USER_APC || ret == STATUS_KERNEL_APC);
@@ -1559,10 +1575,92 @@ static struct
     UINT64 when, cpu, ptime, runnable, instructions, cycles, pageins, read, server_cpu;
     int switches, faults, syscalls, mach_calls;
 } process_stats_last;
+/* added to by any thread: the waits of each kind, each kind on a 128-byte line of its own, and the
+ * wineserver requests of each type; the thread keeps what it saw at the line before */
+static struct { UINT64 count, ticks; char pad[112]; } process_stats_waits[PROCESS_STATS_KINDS];
+static struct { UINT64 count, ticks; } process_stats_requests[REQ_NB_REQUESTS];
+static const char *process_stats_names[REQ_NB_REQUESTS];
+static UINT64 process_stats_seen_waits[PROCESS_STATS_KINDS][2], process_stats_seen_requests[REQ_NB_REQUESTS][2];
+
+UINT64 process_stats_clock(void)
+{
+    return process_stats_interval ? mach_absolute_time() : 0;
+}
+
+void process_stats_note( enum process_stats_kind kind, UINT64 start )
+{
+    if (!start) return;
+    __atomic_fetch_add( &process_stats_waits[kind].count, 1, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &process_stats_waits[kind].ticks, mach_absolute_time() - start, __ATOMIC_RELAXED );
+}
+
+/* name: SERVER_START_REQ's string in ntdll.so itself, kept; NULL from the WoW64 side */
+void process_stats_request( int type, const char *name, UINT64 start )
+{
+    if (!start || type < 0 || type >= REQ_NB_REQUESTS) return;
+    __atomic_fetch_add( &process_stats_requests[type].count, 1, __ATOMIC_RELAXED );
+    __atomic_fetch_add( &process_stats_requests[type].ticks, mach_absolute_time() - start, __ATOMIC_RELAXED );
+    if (name && !process_stats_names[type]) process_stats_names[type] = name;
+}
 
 static double process_stats_seconds( UINT64 ticks )
 {
     return (double)ticks * process_stats_timebase.numer / process_stats_timebase.denom / 1e9;
+}
+
+/* the differences since the line before: of one kind of wait, and of the wineserver requests, with
+ * the three types that took the most time written into top */
+static void process_stats_take_wait( int kind, UINT64 *count, UINT64 *ticks )
+{
+    UINT64 c = __atomic_load_n( &process_stats_waits[kind].count, __ATOMIC_RELAXED );
+    UINT64 t = __atomic_load_n( &process_stats_waits[kind].ticks, __ATOMIC_RELAXED );
+
+    *count = c - process_stats_seen_waits[kind][0];
+    *ticks = t - process_stats_seen_waits[kind][1];
+    process_stats_seen_waits[kind][0] = c;
+    process_stats_seen_waits[kind][1] = t;
+}
+
+static void process_stats_take_requests( UINT64 *calls, UINT64 *ticks, char *top, size_t size )
+{
+    UINT64 best_count[3] = {0}, best_ticks[3] = {0};
+    int best[3] = {-1, -1, -1}, i, j, used = 0;
+
+    *calls = *ticks = 0;
+    for (i = 0; i < REQ_NB_REQUESTS; i++)
+    {
+        UINT64 c = __atomic_load_n( &process_stats_requests[i].count, __ATOMIC_RELAXED );
+        UINT64 t = __atomic_load_n( &process_stats_requests[i].ticks, __ATOMIC_RELAXED );
+        UINT64 dc = c - process_stats_seen_requests[i][0], dt = t - process_stats_seen_requests[i][1];
+
+        process_stats_seen_requests[i][0] = c;
+        process_stats_seen_requests[i][1] = t;
+        if (!dc) continue;
+        *calls += dc;
+        *ticks += dt;
+        for (j = 0; j < 3; j++)
+        {
+            if (best[j] != -1 && dt <= best_ticks[j]) continue;
+            memmove( best + j + 1, best + j, (2 - j) * sizeof(*best) );
+            memmove( best_count + j + 1, best_count + j, (2 - j) * sizeof(*best_count) );
+            memmove( best_ticks + j + 1, best_ticks + j, (2 - j) * sizeof(*best_ticks) );
+            best[j] = i;
+            best_count[j] = dc;
+            best_ticks[j] = dt;
+            break;
+        }
+    }
+    top[0] = 0;
+    for (j = 0; j < 3 && best[j] != -1; j++)
+    {
+        char unnamed[16];
+        const char *name = process_stats_names[best[j]];
+
+        if (!name) snprintf( unnamed, sizeof(unnamed), "request%d", best[j] );
+        used += snprintf( top + used, size - used, "%s%s %llu %.3f s", j ? ", " : "", name ? name : unnamed,
+                          (unsigned long long)best_count[j], process_stats_seconds( best_ticks[j] ) );
+        if (used >= (int)size) break;
+    }
 }
 
 static void process_stats_say( BOOL exiting )
@@ -1574,7 +1672,9 @@ static void process_stats_say( BOOL exiting )
     struct timespec cpu0, cpu1;
     UINT64 now = mach_absolute_time(), cpu, ptime, runnable, server_cpu = 0;
     double window, used, waiting;
-    char line[1024], clock_text[16] = "";
+    char line[1536], clock_text[16] = "", top[256];
+    UINT64 calls, call_ticks, n[PROCESS_STATS_KINDS], ticks[PROCESS_STATS_KINDS];
+    int i;
     int pressure = 0, thermal = -1, len;
     size_t size = sizeof(pressure);
     uint64_t state;
@@ -1601,12 +1701,15 @@ static void process_stats_say( BOOL exiting )
     used = process_stats_seconds( cpu - process_stats_last.cpu );
     /* runnable time includes the time running: what is left is time ready but waiting for a core */
     waiting = process_stats_seconds( runnable - process_stats_last.runnable ) - used;
+    process_stats_take_requests( &calls, &call_ticks, top, sizeof(top) );
+    for (i = 0; i < PROCESS_STATS_KINDS; i++) process_stats_take_wait( i, &n[i], &ticks[i] );
     clock_gettime( CLOCK_THREAD_CPUTIME_ID, &cpu1 );
     len = snprintf( line, sizeof(line),
                     "Process: the last %.0f s (%s, pid %d, %s%s): cpu %.2f s, P cores %.0f%%, waiting for a core "
                     "%.2f s, ipc %.2f, threads %d, switches %d, faults %d, syscalls %d, mach calls %d; memory: "
                     "%llu MB, compressed %llu MB, graphics %llu MB, page-ins %llu, read %llu MB, pressure %d, "
-                    "thermal %d; wineserver: its cpu %.2f s; recorder %lld us\n",
+                    "thermal %d; wineserver: calls %llu %.3f s (%s), waits %llu %.2f s, its cpu %.2f s; waits: fsync "
+                    "%llu %.2f s, by address %llu %.2f s, sleeps %llu %.2f s, yields %llu %.3f s; recorder %lld us\n",
                     window, process_stats_program, getpid(), clock_text, exiting ? ", exit" : "", used,
                     cpu > process_stats_last.cpu ? 100.0 * (ptime - process_stats_last.ptime) / (cpu - process_stats_last.cpu) : 0.0,
                     waiting > 0 ? waiting : 0.0,
@@ -1618,7 +1721,13 @@ static void process_stats_say( BOOL exiting )
                     (unsigned long long)(vm.ledger_tag_graphics_footprint >> 20),
                     (unsigned long long)(ri.ri_pageins - process_stats_last.pageins),
                     (unsigned long long)((ri.ri_diskio_bytesread - process_stats_last.read) >> 20), pressure, thermal,
+                    (unsigned long long)calls, process_stats_seconds( call_ticks ), top,
+                    (unsigned long long)n[PROCESS_STATS_SERVER_WAIT], process_stats_seconds( ticks[PROCESS_STATS_SERVER_WAIT] ),
                     process_stats_seconds( server_cpu - process_stats_last.server_cpu ),
+                    (unsigned long long)n[PROCESS_STATS_FSYNC], process_stats_seconds( ticks[PROCESS_STATS_FSYNC] ),
+                    (unsigned long long)n[PROCESS_STATS_ADDRESS], process_stats_seconds( ticks[PROCESS_STATS_ADDRESS] ),
+                    (unsigned long long)n[PROCESS_STATS_SLEEP], process_stats_seconds( ticks[PROCESS_STATS_SLEEP] ),
+                    (unsigned long long)n[PROCESS_STATS_YIELD], process_stats_seconds( ticks[PROCESS_STATS_YIELD] ),
                     (long long)((cpu1.tv_sec - cpu0.tv_sec) * 1000000 + (cpu1.tv_nsec - cpu0.tv_nsec) / 1000) );
     if (len > 0) write( 2, line, min( len, (int)sizeof(line) - 1 ) );
 
@@ -2219,6 +2328,10 @@ NTSTATUS wow64_wine_server_call( void *args )
     NTSTATUS status;
     struct __server_request_info req;
 
+#ifdef __APPLE__
+    /* the request's name is set by SERVER_START_REQ on the 64-bit side only: not stack contents */
+    req.name = NULL;
+#endif
     req.u.req = req32->u.req;
     req.data_count = req32->data_count;
     for (i = 0; i < req.data_count; i++)

@@ -304,7 +304,7 @@ static int futex_wait_multiple( const struct futex_waitv *futexes,
 {
     const uint64_t slice = 100000000;
     const int direct = (count == 1 && !futexes[0].__reserved);
-    uint64_t timeout_ns = 0, ns, *channel = NULL, word;
+    uint64_t timeout_ns = 0, ns, *channel = NULL, word, start;
     int i, ret, err;
 
     if (end)
@@ -345,8 +345,10 @@ static int futex_wait_multiple( const struct futex_waitv *futexes,
             unsigned int *sleepers = fsync_sleepers( u64_to_ptr(futexes[0].uaddr) );
 
             __atomic_add_fetch( &sleepers[3], 1, __ATOMIC_SEQ_CST );
+            start = process_stats_clock();
             ret = fsync_shared_wait( u64_to_ptr(futexes[0].uaddr), futexes[0].val, 4, ns );
             err = errno;
+            process_stats_note( PROCESS_STATS_FSYNC, start );
             __atomic_sub_fetch( &sleepers[3], 1, __ATOMIC_SEQ_CST );
             if (fsync_stats) __atomic_add_fetch( &fsync_stat_direct, 1, __ATOMIC_RELAXED );
         }
@@ -370,8 +372,10 @@ static int futex_wait_multiple( const struct futex_waitv *futexes,
                 errno = EAGAIN;
                 return -1;
             }
+            start = process_stats_clock();
             ret = fsync_shared_wait( channel, word, 8, ns );
             err = errno;
+            process_stats_note( PROCESS_STATS_FSYNC, start );
             if (fsync_stats)
             {
                 __atomic_add_fetch( &fsync_stat_several, 1, __ATOMIC_RELAXED );
