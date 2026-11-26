@@ -1318,7 +1318,17 @@ HKL WINAPI NtUserActivateKeyboardLayout( HKL layout, UINT flags )
 
     TRACE_(keyboard)( "layout %p, flags %x\n", layout, flags );
 
+#ifdef __APPLE__
+    /* once: Red Dead Redemption 2 calls this with KLF_RESET about 110 times a second, and the
+     * line filled 94% of its log */
+    if (flags)
+    {
+        static int once;
+        if (!once++) FIXME_(keyboard)( "flags %x not supported\n", flags );
+    }
+#else
     if (flags) FIXME_(keyboard)( "flags %x not supported\n", flags );
+#endif
 
     if (layout == (HKL)HKL_NEXT || layout == (HKL)HKL_PREV)
     {
