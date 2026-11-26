@@ -1608,6 +1608,90 @@ static double process_stats_seconds( UINT64 ticks )
     return (double)ticks * process_stats_timebase.numer / process_stats_timebase.denom / 1e9;
 }
 
+/* FEX's own counters of this process's threads, when FEX keeps them (FEX_PROFILESTATS=1): the
+ * shared memory "fex-<pid>-stats" its unix side makes, version 2, a 64-byte header (its in-use size
+ * at offset 56) and from offset 64 a slot per thread: TID at 4, then the times (in counter ticks)
+ * and counts. A thread's slot is zeroed when FEX gives it to a new thread and keeps its counts
+ * until then, so the differences are taken per slot, by its TID. */
+#define PROCESS_STATS_FEX_SLOTS 4096
+enum { FEX_JIT, FEX_LOCK, FEX_BLOCKS, FEX_SMC, FEX_L1_MISSES, FEX_DISK_MISSES, FEX_VALUES };
+static const unsigned char *process_stats_fex;
+static size_t process_stats_fex_size;
+static UINT64 process_stats_fex_freq;
+static struct { UINT32 tid; UINT64 value[FEX_VALUES]; } *process_stats_fex_seen;
+
+static void process_stats_fex_attach(void)
+{
+    char name[32];
+    struct stat st;
+    void *map;
+    int fd;
+
+    snprintf( name, sizeof(name), "fex-%d-stats", getpid() );
+    if ((fd = shm_open( name, O_RDONLY )) == -1) return;
+    if (!fstat( fd, &st ) && st.st_size >= 64 &&
+        (map = mmap( NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0 )) != MAP_FAILED)
+    {
+        const unsigned char *base = map;
+
+        if (base[0] == 2 && *(const UINT16 *)(base + 2) >= 104 &&
+            (process_stats_fex_seen = calloc( PROCESS_STATS_FEX_SLOTS, sizeof(*process_stats_fex_seen) )))
+        {
+            __asm__ volatile( "mrs %0, cntfrq_el0" : "=r"(process_stats_fex_freq) );
+            process_stats_fex_size = st.st_size;
+            process_stats_fex = base;
+        }
+        else munmap( map, st.st_size );
+    }
+    close( fd );
+}
+
+static void process_stats_fex_take( char *out, size_t size )
+{
+    const unsigned char *base = process_stats_fex;
+    UINT64 total[FEX_VALUES] = {0};
+    size_t in_use, stats_size, slots, i;
+    int threads = 0, k;
+
+    out[0] = 0;
+    if (!base) process_stats_fex_attach();
+    if (!(base = process_stats_fex)) return;
+    stats_size = *(const UINT16 *)(base + 2);
+    in_use = min( (size_t)__atomic_load_n( (const UINT32 *)(base + 56), __ATOMIC_RELAXED ), process_stats_fex_size );
+    slots = in_use > 64 ? min( (in_use - 64) / stats_size, PROCESS_STATS_FEX_SLOTS ) : 0;
+    for (i = 0; i < slots; i++)
+    {
+        const unsigned char *slot = base + 64 + i * stats_size;
+        UINT32 tid = __atomic_load_n( (const UINT32 *)(slot + 4), __ATOMIC_RELAXED );
+        UINT64 value[FEX_VALUES];
+        BOOL fresh = FALSE;
+
+        if (!tid && !process_stats_fex_seen[i].tid) continue;
+        value[FEX_JIT] = *(const volatile UINT64 *)(slot + 8);
+        value[FEX_SMC] = *(const volatile UINT64 *)(slot + 32);
+        value[FEX_L1_MISSES] = *(const volatile UINT64 *)(slot + 48);
+        value[FEX_LOCK] = *(const volatile UINT64 *)(slot + 56) + *(const volatile UINT64 *)(slot + 64);
+        value[FEX_BLOCKS] = *(const volatile UINT64 *)(slot + 72);
+        value[FEX_DISK_MISSES] = *(const volatile UINT64 *)(slot + 88);
+        /* a new thread in the slot, or one whose counts went down (given away and back between two
+         * lines): its counts are all new */
+        if (tid && tid != process_stats_fex_seen[i].tid) fresh = TRUE;
+        for (k = 0; k < FEX_VALUES && !fresh; k++) if (value[k] < process_stats_fex_seen[i].value[k]) fresh = TRUE;
+        for (k = 0; k < FEX_VALUES; k++)
+        {
+            total[k] += value[k] - (fresh ? 0 : process_stats_fex_seen[i].value[k]);
+            process_stats_fex_seen[i].value[k] = value[k];
+        }
+        process_stats_fex_seen[i].tid = tid;
+        if (tid) threads++;
+    }
+    snprintf( out, size, "; FEX: threads %d, jit %.2f s, lock %.2f s, blocks %llu, smc %llu, l1 misses %llu, "
+              "disk-cache misses %llu", threads, (double)total[FEX_JIT] / process_stats_fex_freq,
+              (double)total[FEX_LOCK] / process_stats_fex_freq, (unsigned long long)total[FEX_BLOCKS],
+              (unsigned long long)total[FEX_SMC], (unsigned long long)total[FEX_L1_MISSES],
+              (unsigned long long)total[FEX_DISK_MISSES] );
+}
+
 /* the differences since the line before: of one kind of wait, and of the wineserver requests, with
  * the three types that took the most time written into top */
 static void process_stats_take_wait( int kind, UINT64 *count, UINT64 *ticks )
@@ -1672,7 +1756,7 @@ static void process_stats_say( BOOL exiting )
     struct timespec cpu0, cpu1;
     UINT64 now = mach_absolute_time(), cpu, ptime, runnable, server_cpu = 0;
     double window, used, waiting;
-    char line[1536], clock_text[16] = "", top[256];
+    char line[1536], clock_text[16] = "", top[256], fex[200];
     UINT64 calls, call_ticks, n[PROCESS_STATS_KINDS], ticks[PROCESS_STATS_KINDS];
     int i;
     int pressure = 0, thermal = -1, len;
@@ -1703,13 +1787,14 @@ static void process_stats_say( BOOL exiting )
     waiting = process_stats_seconds( runnable - process_stats_last.runnable ) - used;
     process_stats_take_requests( &calls, &call_ticks, top, sizeof(top) );
     for (i = 0; i < PROCESS_STATS_KINDS; i++) process_stats_take_wait( i, &n[i], &ticks[i] );
+    process_stats_fex_take( fex, sizeof(fex) );
     clock_gettime( CLOCK_THREAD_CPUTIME_ID, &cpu1 );
     len = snprintf( line, sizeof(line),
                     "Process: the last %.0f s (%s, pid %d, %s%s): cpu %.2f s, P cores %.0f%%, waiting for a core "
                     "%.2f s, ipc %.2f, threads %d, switches %d, faults %d, syscalls %d, mach calls %d; memory: "
                     "%llu MB, compressed %llu MB, graphics %llu MB, page-ins %llu, read %llu MB, pressure %d, "
                     "thermal %d; wineserver: calls %llu %.3f s (%s), waits %llu %.2f s, its cpu %.2f s; waits: fsync "
-                    "%llu %.2f s, by address %llu %.2f s, sleeps %llu %.2f s, yields %llu %.3f s; recorder %lld us\n",
+                    "%llu %.2f s, by address %llu %.2f s, sleeps %llu %.2f s, yields %llu %.3f s%s; recorder %lld us\n",
                     window, process_stats_program, getpid(), clock_text, exiting ? ", exit" : "", used,
                     cpu > process_stats_last.cpu ? 100.0 * (ptime - process_stats_last.ptime) / (cpu - process_stats_last.cpu) : 0.0,
                     waiting > 0 ? waiting : 0.0,
@@ -1727,7 +1812,7 @@ static void process_stats_say( BOOL exiting )
                     (unsigned long long)n[PROCESS_STATS_FSYNC], process_stats_seconds( ticks[PROCESS_STATS_FSYNC] ),
                     (unsigned long long)n[PROCESS_STATS_ADDRESS], process_stats_seconds( ticks[PROCESS_STATS_ADDRESS] ),
                     (unsigned long long)n[PROCESS_STATS_SLEEP], process_stats_seconds( ticks[PROCESS_STATS_SLEEP] ),
-                    (unsigned long long)n[PROCESS_STATS_YIELD], process_stats_seconds( ticks[PROCESS_STATS_YIELD] ),
+                    (unsigned long long)n[PROCESS_STATS_YIELD], process_stats_seconds( ticks[PROCESS_STATS_YIELD] ), fex,
                     (long long)((cpu1.tv_sec - cpu0.tv_sec) * 1000000 + (cpu1.tv_nsec - cpu0.tv_nsec) / 1000) );
     if (len > 0) write( 2, line, min( len, (int)sizeof(line) - 1 ) );
 
