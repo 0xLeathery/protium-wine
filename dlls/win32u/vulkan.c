@@ -2939,15 +2939,29 @@ static double frame_time_at( double share )
     return frame_stats.worst_ns / 1e6;
 }
 
+/* "<program>, HH:MM:SS", the time of day of the lines, so that they can be put beside other logs and
+ * the player's account of a session; the program alone if the clock cannot be read */
+static void stats_head( char *head, size_t size )
+{
+    time_t now = time( NULL );
+    char clock_text[16];
+    struct tm tm;
+
+    if (localtime_r( &now, &tm ) && strftime( clock_text, sizeof(clock_text), "%H:%M:%S", &tm ))
+        snprintf( head, size, "%s, %s", stats_program_name(), clock_text );
+    else
+        snprintf( head, size, "%s", stats_program_name() );
+}
+
 /* frame_stats_lock held */
 static void say_frame_stats(void)
 {
-    const char *name = stats_program_name();
     double frames = frame_stats.window_frames, submits, buffers, submit_ms, acquires, acquire_ms, present_ms, driver_ms;
-    char text[800];
+    char text[800], name[96];
     int used;
     UINT i;
 
+    stats_head( name, sizeof(name) );
     MESSAGE( "Vulkan: frame times (%s): %llu frames in %llu s, median %.1f ms, 95%% %.1f ms, 99%% %.1f ms, "
              "worst %.1f ms, %llu over 50 ms\n", name, (unsigned long long)frame_stats.count,
              (unsigned long long)(frame_stats.total_ns / 1000000000), frame_time_at( 0.50 ), frame_time_at( 0.95 ),
