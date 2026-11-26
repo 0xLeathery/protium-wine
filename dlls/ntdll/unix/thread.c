@@ -1493,6 +1493,9 @@ void abort_thread( int status )
  */
 void abort_process( int status )
 {
+#ifdef __APPLE__
+    process_stats_exit();
+#endif
     _exit( get_unix_exit_code( status ));
 }
 

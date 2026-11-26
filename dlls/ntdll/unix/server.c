@@ -1532,6 +1532,191 @@ static void send_server_task_port(void)
     mach_port_deallocate(mach_task_self(), wineserver_port);
 }
 #endif  /* __APPLE__ */
+#ifdef __APPLE__
+#include <libkern/OSThermalNotification.h>
+#include <libproc.h>
+#include <mach/mach_time.h>
+#include <notify.h>
+#include <sys/sysctl.h>
+#include <time.h>
+
+/* The process line, with WINE_PROCESS_STATS=<seconds>: every so many seconds, at the same moments in
+ * every process (whole multiples of the interval on the clock), one line on stderr, the game's log,
+ * of what this process's threads did since the line before, from counters macOS keeps for it:
+ * processor time and the share of it on performance cores, time ready to run but waiting for a
+ * core, memory, page-ins and reads, the system's memory pressure and thermal level, and the
+ * wineserver's processor time. A thread of its own writes it, which has no TEB: it takes no Wine
+ * lock and makes no Wine or server call, only system calls. process_exit_wrapper writes a last
+ * line, marked "exit"; the first one covers the process's life from its start. */
+static int process_stats_interval;
+static char process_stats_program[64];
+static pid_t process_stats_server;
+static int process_stats_thermal = -1;
+static mach_timebase_info_data_t process_stats_timebase;
+static LONG process_stats_busy;
+static struct
+{
+    UINT64 when, cpu, ptime, runnable, instructions, cycles, pageins, read, server_cpu;
+    int switches, faults, syscalls, mach_calls;
+} process_stats_last;
+
+static double process_stats_seconds( UINT64 ticks )
+{
+    return (double)ticks * process_stats_timebase.numer / process_stats_timebase.denom / 1e9;
+}
+
+static void process_stats_say( BOOL exiting )
+{
+    struct rusage_info_v6 ri, server_ri;
+    struct proc_taskinfo ti;
+    task_vm_info_data_t vm;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    struct timespec cpu0, cpu1;
+    UINT64 now = mach_absolute_time(), cpu, ptime, runnable, server_cpu = 0;
+    double window, used, waiting;
+    char line[1024], clock_text[16] = "";
+    int pressure = 0, thermal = -1, len;
+    size_t size = sizeof(pressure);
+    uint64_t state;
+    time_t t = time( NULL );
+    struct tm tm;
+
+    clock_gettime( CLOCK_THREAD_CPUTIME_ID, &cpu0 );
+    if (proc_pid_rusage( getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&ri )) return;
+    memset( &ti, 0, sizeof(ti) );
+    proc_pidinfo( getpid(), PROC_PIDTASKINFO, 0, &ti, sizeof(ti) );
+    memset( &vm, 0, sizeof(vm) );
+    task_info( mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count );
+    if (process_stats_server > 0 &&
+        !proc_pid_rusage( process_stats_server, RUSAGE_INFO_V6, (rusage_info_t *)&server_ri ))
+        server_cpu = server_ri.ri_user_time + server_ri.ri_system_time;
+    sysctlbyname( "kern.memorystatus_vm_pressure_level", &pressure, &size, NULL, 0 );
+    if (process_stats_thermal != -1 && !notify_get_state( process_stats_thermal, &state )) thermal = state;
+    if (localtime_r( &t, &tm )) strftime( clock_text, sizeof(clock_text), "%H:%M:%S", &tm );
+
+    cpu = ri.ri_user_time + ri.ri_system_time;
+    ptime = ri.ri_user_ptime + ri.ri_system_ptime;
+    runnable = ri.ri_runnable_time;
+    window = process_stats_seconds( now - process_stats_last.when );
+    used = process_stats_seconds( cpu - process_stats_last.cpu );
+    /* runnable time includes the time running: what is left is time ready but waiting for a core */
+    waiting = process_stats_seconds( runnable - process_stats_last.runnable ) - used;
+    clock_gettime( CLOCK_THREAD_CPUTIME_ID, &cpu1 );
+    len = snprintf( line, sizeof(line),
+                    "Process: the last %.0f s (%s, pid %d, %s%s): cpu %.2f s, P cores %.0f%%, waiting for a core "
+                    "%.2f s, ipc %.2f, threads %d, switches %d, faults %d, syscalls %d, mach calls %d; memory: "
+                    "%llu MB, compressed %llu MB, graphics %llu MB, page-ins %llu, read %llu MB, pressure %d, "
+                    "thermal %d; wineserver: its cpu %.2f s; recorder %lld us\n",
+                    window, process_stats_program, getpid(), clock_text, exiting ? ", exit" : "", used,
+                    cpu > process_stats_last.cpu ? 100.0 * (ptime - process_stats_last.ptime) / (cpu - process_stats_last.cpu) : 0.0,
+                    waiting > 0 ? waiting : 0.0,
+                    ri.ri_cycles > process_stats_last.cycles ?
+                        (double)(ri.ri_instructions - process_stats_last.instructions) / (ri.ri_cycles - process_stats_last.cycles) : 0.0,
+                    ti.pti_threadnum, ti.pti_csw - process_stats_last.switches, ti.pti_faults - process_stats_last.faults,
+                    ti.pti_syscalls_unix - process_stats_last.syscalls, ti.pti_syscalls_mach - process_stats_last.mach_calls,
+                    (unsigned long long)(vm.phys_footprint >> 20), (unsigned long long)(vm.compressed >> 20),
+                    (unsigned long long)(vm.ledger_tag_graphics_footprint >> 20),
+                    (unsigned long long)(ri.ri_pageins - process_stats_last.pageins),
+                    (unsigned long long)((ri.ri_diskio_bytesread - process_stats_last.read) >> 20), pressure, thermal,
+                    process_stats_seconds( server_cpu - process_stats_last.server_cpu ),
+                    (long long)((cpu1.tv_sec - cpu0.tv_sec) * 1000000 + (cpu1.tv_nsec - cpu0.tv_nsec) / 1000) );
+    if (len > 0) write( 2, line, min( len, (int)sizeof(line) - 1 ) );
+
+    process_stats_last.when = now;
+    process_stats_last.cpu = cpu;
+    process_stats_last.ptime = ptime;
+    process_stats_last.runnable = runnable;
+    process_stats_last.instructions = ri.ri_instructions;
+    process_stats_last.cycles = ri.ri_cycles;
+    process_stats_last.pageins = ri.ri_pageins;
+    process_stats_last.read = ri.ri_diskio_bytesread;
+    process_stats_last.server_cpu = server_cpu;
+    process_stats_last.switches = ti.pti_csw;
+    process_stats_last.faults = ti.pti_faults;
+    process_stats_last.syscalls = ti.pti_syscalls_unix;
+    process_stats_last.mach_calls = ti.pti_syscalls_mach;
+}
+
+static void *process_stats_thread( void *arg )
+{
+    pthread_setname_np( "wine-stats" );
+    pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
+    for (;;)
+    {
+        struct timespec now, wait;
+        long left;
+
+        /* to the next whole multiple of the interval, at least 5 s away for intervals of 10 s or more */
+        clock_gettime( CLOCK_REALTIME, &now );
+        left = process_stats_interval - now.tv_sec % process_stats_interval;
+        if (left < 5 && process_stats_interval >= 10) left += process_stats_interval;
+        wait.tv_sec = now.tv_nsec ? left - 1 : left;
+        wait.tv_nsec = now.tv_nsec ? 1000000000 - now.tv_nsec : 0;
+        nanosleep( &wait, NULL );
+        if (__atomic_exchange_n( &process_stats_busy, 1, __ATOMIC_ACQUIRE )) continue;
+        process_stats_say( FALSE );
+        __atomic_store_n( &process_stats_busy, 0, __ATOMIC_RELEASE );
+    }
+    return arg;
+}
+
+/* called on the main thread before it runs the program's code */
+static void process_stats_start(void)
+{
+    const char *env = getenv( "WINE_PROCESS_STATS" );
+    const WCHAR *path = NULL, *p;
+    struct rusage_info_v6 ri;
+    socklen_t len = sizeof(process_stats_server);
+    pthread_attr_t attr;
+    sigset_t all, old;
+    pthread_t thread;
+    unsigned int i = 0;
+
+    if (!env || (process_stats_interval = atoi( env )) <= 0)
+    {
+        process_stats_interval = 0;
+        return;
+    }
+    mach_timebase_info( &process_stats_timebase );
+    if (peb && peb->ProcessParameters) path = peb->ProcessParameters->ImagePathName.Buffer;
+    if (path)
+    {
+        for (p = path; *p; p++) if (*p == '\\' || *p == '/') path = p + 1;
+        for (p = path; *p && i < sizeof(process_stats_program) - 1; p++)
+            process_stats_program[i++] = *p >= 0x80 ? '?' : (*p == ',' || *p == '(' || *p == ')') ? '_' : *p;
+    }
+    if (!i) process_stats_program[i++] = '?';
+    process_stats_program[i] = 0;
+    if (getsockopt( fd_socket, SOL_LOCAL, LOCAL_PEERPID, &process_stats_server, &len )) process_stats_server = 0;
+    if (notify_register_check( kOSThermalNotificationPressureLevelName, &process_stats_thermal ))
+        process_stats_thermal = -1;
+    if (!proc_pid_rusage( getpid(), RUSAGE_INFO_V6, (rusage_info_t *)&ri ))
+        process_stats_last.when = ri.ri_proc_start_abstime;
+
+    sigfillset( &all );
+    pthread_sigmask( SIG_BLOCK, &all, &old );
+    pthread_attr_init( &attr );
+    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
+    if (pthread_create( &thread, &attr, process_stats_thread, NULL )) process_stats_interval = 0;
+    pthread_attr_destroy( &attr );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+}
+
+/* the last line, as the process exits: from process_exit_wrapper, and from abort_process, by which
+ * a process that terminates itself, or whose last thread is terminated (the way a WoW64 process
+ * ends), goes; not if the thread has been writing one for 10 ms */
+void process_stats_exit(void)
+{
+    UINT64 start;
+
+    if (!process_stats_interval) return;
+    start = mach_absolute_time();
+    while (__atomic_exchange_n( &process_stats_busy, 1, __ATOMIC_ACQUIRE ))
+        if (process_stats_seconds( mach_absolute_time() - start ) > 0.01) return;
+    process_stats_say( TRUE );
+}
+
+#endif
 
 
 /***********************************************************************
@@ -1595,6 +1780,9 @@ static int init_thread_pipe(void)
  */
 void process_exit_wrapper( int status )
 {
+#ifdef __APPLE__
+    process_stats_exit();
+#endif
     close( fd_socket );
     exit( status );
 }
@@ -1804,6 +1992,9 @@ void server_init_process_done(void)
             wow64_params->Flags &= ~PROCESS_PARAMS_IMAGE_KEY_MISSING;
         }
     }
+#ifdef __APPLE__
+    process_stats_start();
+#endif
     signal_start_thread( main_image_info.TransferAddress, peb, suspend, NtCurrentTeb() );
 }
 

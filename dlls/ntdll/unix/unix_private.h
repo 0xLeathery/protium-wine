@@ -253,6 +253,9 @@ extern int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *u
                                int *needs_close, enum server_fd_type *type, unsigned int *options );
 extern int wine_server_receive_fd( obj_handle_t *handle );
 extern void process_exit_wrapper( int status ) DECLSPEC_NORETURN;
+#ifdef __APPLE__
+extern void process_stats_exit(void);
+#endif
 extern size_t server_init_process(void);
 extern void server_init_process_done(void);
 extern void server_init_thread( void *entry_point, BOOL *suspend );
