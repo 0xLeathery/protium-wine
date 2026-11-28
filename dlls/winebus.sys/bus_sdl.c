@@ -1192,6 +1192,12 @@ NTSTATUS sdl_bus_init(void *args)
     pSDL_SetHintWithPriority("SteamVirtualGamepadInfo", "", SDL_HINT_OVERRIDE);
     unsetenv("SteamVirtualGamepadInfo");
 
+#ifdef __APPLE__
+    /* SDL takes SIGINT and SIGTERM for itself and makes a quit event of them, which nothing here
+     * reads: this process, winedevice.exe, was the one of a session that a plain kill did not end. */
+    pSDL_SetHintWithPriority("SDL_NO_SIGNAL_HANDLERS", "1", SDL_HINT_OVERRIDE);
+
+#endif
     if (pSDL_Init(SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC) < 0)
     {
         ERR("could not init SDL: %s\n", pSDL_GetError());
