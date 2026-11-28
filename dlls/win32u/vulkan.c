@@ -2916,10 +2916,14 @@ static struct
 } frame_stats;
 
 /* added up by any thread, said and cleared with the half-minute lines */
-static struct
+static struct call_stats
 {
     UINT64 submits, buffers, submit_ns, acquires, acquire_ns, present_ns, driver_present_ns;
 } call_stats;
+
+/* call_stats as they were at the frame before: what a slow frame's own calls were is the
+ * difference (frame_stats_lock held) */
+static struct call_stats frame_calls;
 
 static UINT64 stats_now_ns(void)
 {
@@ -3019,6 +3023,37 @@ static void say_frame_stats(void)
                  driver_ms / frames );
 }
 
+static UINT64 stats_read( const UINT64 *counter )
+{
+    return __atomic_load_n( counter, __ATOMIC_RELAXED );
+}
+
+/* What the program's threads spent in the host driver during a frame of over 50 ms, said as it is
+ * noticed, for the first 24 of a half minute: the half-minute line's numbers for one frame, as
+ * DXMT says them for a slow Direct3D 11 frame (macos/patches/dxmt/0015). The calls are those of
+ * all threads between this present and the one before. frame_stats_lock held. */
+static void say_slow_frame( UINT64 ns )
+{
+    UINT64 submits = stats_read( &call_stats.submits ) - frame_calls.submits;
+    UINT64 buffers = stats_read( &call_stats.buffers ) - frame_calls.buffers;
+    UINT64 acquires = stats_read( &call_stats.acquires ) - frame_calls.acquires;
+    struct timespec ts;
+    char clock_text[16];
+    struct tm tm;
+
+    clock_gettime( CLOCK_REALTIME, &ts );
+    if (!localtime_r( &ts.tv_sec, &tm ) || !strftime( clock_text, sizeof(clock_text), "%H:%M:%S", &tm ))
+        strcpy( clock_text, "?" );
+    MESSAGE( "Vulkan: slow frame (%s, %s.%d): %.1f ms: %llu %s of %llu command %s, %.2f ms in the driver's submit, "
+             "%llu %s %.2f ms, present %.2f ms (the driver's %.2f ms)\n", stats_program_name(), clock_text,
+             (int)(ts.tv_nsec / 100000000), ns / 1e6, (unsigned long long)submits, submits == 1 ? "submit" : "submits",
+             (unsigned long long)buffers, buffers == 1 ? "buffer" : "buffers",
+             (stats_read( &call_stats.submit_ns ) - frame_calls.submit_ns) / 1e6, (unsigned long long)acquires,
+             acquires == 1 ? "acquire" : "acquires", (stats_read( &call_stats.acquire_ns ) - frame_calls.acquire_ns) / 1e6,
+             (stats_read( &call_stats.present_ns ) - frame_calls.present_ns) / 1e6,
+             (stats_read( &call_stats.driver_present_ns ) - frame_calls.driver_present_ns) / 1e6 );
+}
+
 static void note_frame(void)
 {
     UINT64 now;
@@ -3042,6 +3077,7 @@ static void note_frame(void)
             {
                 frame_stats.window_slow[frame_stats.window_slow_count].at_s = (now - frame_stats.said_ns) / 1e9;
                 frame_stats.window_slow[frame_stats.window_slow_count].ms = ns / 1e6;
+                say_slow_frame( ns );
             }
             frame_stats.window_slow_count++;
         }
@@ -3055,6 +3091,18 @@ static void note_frame(void)
         say_frame_stats();
         frame_stats.window_frames = 0;
         frame_stats.window_slow_count = 0;
+        /* the half-minute line has taken the calls: the next frame's are all there are then */
+        memset( &frame_calls, 0, sizeof(frame_calls) );
+    }
+    else
+    {
+        frame_calls.submits = stats_read( &call_stats.submits );
+        frame_calls.buffers = stats_read( &call_stats.buffers );
+        frame_calls.submit_ns = stats_read( &call_stats.submit_ns );
+        frame_calls.acquires = stats_read( &call_stats.acquires );
+        frame_calls.acquire_ns = stats_read( &call_stats.acquire_ns );
+        frame_calls.present_ns = stats_read( &call_stats.present_ns );
+        frame_calls.driver_present_ns = stats_read( &call_stats.driver_present_ns );
     }
     pthread_mutex_unlock( &frame_stats_lock );
 }
@@ -3070,6 +3118,7 @@ static void note_swapchain_gone(void)
         frame_stats.window_frames = 0;
         frame_stats.window_slow_count = 0;
         frame_stats.said_ns = stats_now_ns();
+        memset( &frame_calls, 0, sizeof(frame_calls) );
     }
     frame_stats.last_ns = 0;
     pthread_mutex_unlock( &frame_stats_lock );
