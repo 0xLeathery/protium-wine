@@ -1553,6 +1553,7 @@ static void send_server_task_port(void)
 #include <libproc.h>
 #include <mach/mach_time.h>
 #include <notify.h>
+#include <sys/event.h>
 #include <sys/sysctl.h>
 #include <time.h>
 
@@ -1831,22 +1832,78 @@ static void process_stats_say( BOOL exiting )
     process_stats_last.mach_calls = ti.pti_syscalls_mach;
 }
 
+/* The wineserver has ended and this process is still here: it can do nothing more, and nothing
+ * tells it. The server kills its processes before it ends when it is asked to end (wineserver -k,
+ * SIGINT) or has no more use, but not when it is killed, crashes or gets SIGTERM, which only has
+ * it save the registry. A thread of such a process that calls the server ends, and the others stay:
+ * they wait for ever in waits that fsync keeps in shared memory, or poll (winedevice.exe looking
+ * for controllers, at over 1% of a processor: one was found two days and 44 processor minutes
+ * after its game). So this thread, which every process has, watches the server and ends the
+ * process with it. */
+static void process_stats_server_gone(void)
+{
+    char line[160], clock_text[16] = "?";
+    time_t t = time( NULL );
+    struct tm tm;
+    int len;
+
+    if (localtime_r( &t, &tm )) strftime( clock_text, sizeof(clock_text), "%H:%M:%S", &tm );
+    len = snprintf( line, sizeof(line), "Process: (%s, pid %d, %s): the wineserver has ended, so this process ends too\n",
+                    process_stats_program, (int)getpid(), clock_text );
+    if (len > 0 && len < (int)sizeof(line)) write( 2, line, len );
+    _exit( 1 );
+}
+
 static void *process_stats_thread( void *arg )
 {
+    struct kevent event;
+    char name[64];
+    int queue = -1;
+
     pthread_setname_np( "wine-stats" );
     pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
+    /* The pid is that of the process that last used the other end of this process's socket to the
+     * server. Only a process by the server's name is watched: the end of any other one must not end
+     * a process whose server is there. Where the watch can't be set up, there is none. */
+    if (process_stats_server > 0 && proc_name( process_stats_server, name, sizeof(name) ) > 0 &&
+        !strncmp( name, "wineserver", 10 ) && (queue = kqueue()) != -1)
+    {
+        fcntl( queue, F_SETFD, FD_CLOEXEC );
+        EV_SET( &event, process_stats_server, EVFILT_PROC, EV_ADD, NOTE_EXIT, 0, NULL );
+        if (kevent( queue, &event, 1, NULL, 0, NULL ) == -1)
+        {
+            close( queue );
+            queue = -1;
+        }
+    }
+    if (queue == -1 && !process_stats_interval) return arg;  /* nothing to watch and nothing to say */
     for (;;)
     {
         struct timespec now, wait;
         long left;
+        int ret;
 
-        /* to the next whole multiple of the interval, at least 5 s away for intervals of 10 s or more */
-        clock_gettime( CLOCK_REALTIME, &now );
-        left = process_stats_interval - now.tv_sec % process_stats_interval;
-        if (left < 5 && process_stats_interval >= 10) left += process_stats_interval;
-        wait.tv_sec = now.tv_nsec ? left - 1 : left;
-        wait.tv_nsec = now.tv_nsec ? 1000000000 - now.tv_nsec : 0;
-        nanosleep( &wait, NULL );
+        if (process_stats_interval)
+        {
+            /* to the next whole multiple of the interval, at least 5 s away for intervals of 10 s or more */
+            clock_gettime( CLOCK_REALTIME, &now );
+            left = process_stats_interval - now.tv_sec % process_stats_interval;
+            if (left < 5 && process_stats_interval >= 10) left += process_stats_interval;
+            wait.tv_sec = now.tv_nsec ? left - 1 : left;
+            wait.tv_nsec = now.tv_nsec ? 1000000000 - now.tv_nsec : 0;
+        }
+        if (queue == -1) nanosleep( &wait, NULL );
+        else if ((ret = kevent( queue, NULL, 0, &event, 1, process_stats_interval ? &wait : NULL )))
+        {
+            if (ret > 0 && event.filter == EVFILT_PROC && (event.fflags & NOTE_EXIT)) process_stats_server_gone();
+            if (ret == -1 && errno == EINTR) continue;
+            /* the queue can't be waited on (were its descriptor closed, each try would fail at once):
+             * no watch from here on, and the lines go on by the clock */
+            queue = -1;
+            if (!process_stats_interval) return arg;
+            continue;
+        }
+        if (!process_stats_interval) continue;
         if (__atomic_exchange_n( &process_stats_busy, 1, __ATOMIC_ACQUIRE )) continue;
         process_stats_say( FALSE );
         __atomic_store_n( &process_stats_busy, 0, __ATOMIC_RELEASE );
@@ -1866,11 +1923,8 @@ static void process_stats_start(void)
     pthread_t thread;
     unsigned int i = 0;
 
-    if (!env || (process_stats_interval = atoi( env )) <= 0)
-    {
-        process_stats_interval = 0;
-        return;
-    }
+    /* without the lines the thread still watches the wineserver */
+    if (!env || (process_stats_interval = atoi( env )) <= 0) process_stats_interval = 0;
     mach_timebase_info( &process_stats_timebase );
     if (peb && peb->ProcessParameters) path = peb->ProcessParameters->ImagePathName.Buffer;
     if (path)
