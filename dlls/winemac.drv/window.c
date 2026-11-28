@@ -1528,6 +1528,19 @@ UINT macdrv_ShowWindow(HWND hwnd, INT cmd, RECT *rect, UINT swp)
         thread_data->current_event->type != WINDOW_DID_UNMINIMIZE)
         goto done;
 
+#ifdef __APPLE__
+    /* A window that comes back from the Dock still has its minimized rects here, so its Cocoa
+     * frame cannot be made a window rect: it is in the screen's own coordinates and is the
+     * visible rect, which for a full-screen window on an emulated display mode is the whole
+     * screen. Taken as it was, DOOM (2016) at 2560x1440 on a 5120x1440 screen came back 5120
+     * and then 6400 wide. The rect win32u restores it to is the right one. */
+    if (thread_data->current_event->type == WINDOW_DID_UNMINIMIZE)
+    {
+        TRACE("win %p restored from the Dock: keeping %s\n", hwnd, wine_dbgstr_rect(rect));
+        goto done;
+    }
+
+#endif
     macdrv_get_cocoa_window_frame(data->cocoa_window, &frame);
     *rect = rect_from_cgrect(frame);
     *rect = window_rect_from_visible(&data->rects, *rect);

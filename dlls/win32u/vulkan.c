@@ -2699,6 +2699,28 @@ fail:
     return res;
 }
 
+#ifdef __APPLE__
+/* The fullscreen hack's host swapchain has the host surface's size when it was made. On macOS the
+ * window can come back at another size (after the game was switched away from) with the client
+ * rect the same, so that the host swapchain was stretched over it out of shape: ask for a new
+ * swapchain when the host surface's current extent is not the one it was made for. */
+static BOOL fshack_host_resized( struct vulkan_device *device, struct swapchain *swapchain )
+{
+    struct vulkan_physical_device *physical_device = device->physical_device;
+    VkSurfaceCapabilitiesKHR caps;
+
+    if (!swapchain->fshack_dpi) return FALSE;
+    if (physical_device->instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device,
+                                                                                swapchain->surface->obj.host.surface, &caps ))
+        return FALSE;
+    /* a hidden or minimized window's surface reads 1x1: nothing to make a swapchain for */
+    if (caps.currentExtent.width <= 1 && caps.currentExtent.height <= 1) return FALSE;
+    return caps.currentExtent.width != 0xffffffff &&
+           (caps.currentExtent.width != swapchain->host_extents.width ||
+            caps.currentExtent.height != swapchain->host_extents.height);
+}
+
+#endif
 static BOOL surface_get_fshack_dpi( struct surface *surface )
 {
     UINT dpi = NtUserGetDpiForWindow( surface->hwnd ), raw = NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI );
@@ -3080,14 +3102,36 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
 #endif
 
+#ifdef __APPLE__
+    /* as for a present: an image of a minimized window's swapchain is as good as it gets */
+    if (res == VK_SUBOPTIMAL_KHR && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+        IsRectEmpty( &client_rect ))
+        res = VK_SUCCESS;
+
+#endif
     if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
     {
         WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
         return VK_SUBOPTIMAL_KHR;
     }
+#ifdef __APPLE__
+    if (!res && fshack_host_resized( device, swapchain ))
+    {
+        WARN( "window %p swapchain %p: the host surface changed size, VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
+        return VK_SUBOPTIMAL_KHR;
+    }
+#endif
 
+#ifdef __APPLE__
+    /* A minimized window's client rect is empty, and no swapchain can be made to match it: saying
+     * "suboptimal" then had DOOM (2016) make a new swapchain for every frame while it was switched
+     * away from (1668 in a minute), each of which left its drawables' surfaces behind (24 GB). */
+    if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+        !IsRectEmpty( &client_rect ) && !extents_equals( &swapchain->extents, &client_rect ))
+#else
     if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
+#endif
     {
         WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
@@ -3119,14 +3163,36 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     stats_add( &call_stats.acquires, 1 );
 #endif
 
+#ifdef __APPLE__
+    /* as for a present: an image of a minimized window's swapchain is as good as it gets */
+    if (res == VK_SUBOPTIMAL_KHR && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+        IsRectEmpty( &client_rect ))
+        res = VK_SUCCESS;
+
+#endif
     if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
     {
         WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
         return VK_SUBOPTIMAL_KHR;
     }
+#ifdef __APPLE__
+    if (!res && fshack_host_resized( device, swapchain ))
+    {
+        WARN( "window %p swapchain %p: the host surface changed size, VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
+        return VK_SUBOPTIMAL_KHR;
+    }
+#endif
 
+#ifdef __APPLE__
+    /* A minimized window's client rect is empty, and no swapchain can be made to match it: saying
+     * "suboptimal" then had DOOM (2016) make a new swapchain for every frame while it was switched
+     * away from (1668 in a minute), each of which left its drawables' surfaces behind (24 GB). */
+    if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+        !IsRectEmpty( &client_rect ) && !extents_equals( &swapchain->extents, &client_rect ))
+#else
     if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
+#endif
     {
         WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
@@ -3407,6 +3473,33 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 #endif
     pthread_mutex_unlock( &lock );
 
+#ifdef __APPLE__
+    /* The surface of a minimized window reads 1x1, and the driver says "suboptimal" to every
+     * present to it. On Windows a present to a minimized window succeeds: DOOM (2016) made a new
+     * swapchain at each such answer, hundreds while it sat in the Dock, and each one's drawable
+     * surfaces stayed behind (7 GB in half a minute). */
+    if (res == VK_SUBOPTIMAL_KHR)
+    {
+        BOOL hidden = TRUE;
+
+        for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+        {
+            struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+            VkResult swapchain_res = present_info->pResults ? present_info->pResults[i] : res;
+            RECT client_rect;
+
+            if (swapchain_res != VK_SUBOPTIMAL_KHR) continue;
+            if (get_surface_rect( swapchain->surface->hwnd, &client_rect, NtUserGetDpiForWindow( swapchain->surface->hwnd ) ) &&
+                IsRectEmpty( &client_rect ))
+            {
+                if (present_info->pResults) present_info->pResults[i] = VK_SUCCESS;
+            }
+            else hidden = FALSE;
+        }
+        if (hidden) res = VK_SUCCESS;
+    }
+
+#endif
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
@@ -3425,7 +3518,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
         else if (swapchain_res)
             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
+#ifdef __APPLE__
+        else if (!IsRectEmpty( &client_rect ) && !extents_equals( &swapchain->extents, &client_rect ))
+#else
         else if (!extents_equals( &swapchain->extents, &client_rect ))
+#endif
         {
             WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
