@@ -2241,7 +2241,16 @@ static NTSTATUS wg_parser_create(void *args)
 
     if (!(parser = calloc(1, sizeof(*parser))))
         return E_OUTOFMEMORY;
+#ifdef __APPLE__
+    /* Proton has the Windows Media reader of a 32-bit program convert its video with OpenGL, as the
+     * 32-bit ORC of a Linux host is slow at it. Here GStreamer and ORC are arm64 whatever the
+     * program is, and GStreamer's OpenGL wants a Cocoa window made on the process's first thread,
+     * which is no Wine thread: it faulted there again and again (a core busy, millions of faults)
+     * and the reader never opened the file. Never OpenGL. */
+    if ((parser->use_opengl = FALSE))
+#else
     if ((parser->use_opengl = params->use_opengl && gl_display))
+#endif
     {
         if ((parser->context = gst_context_new(GST_GL_DISPLAY_CONTEXT_TYPE, false)))
             gst_context_set_gl_display(parser->context, gl_display);
