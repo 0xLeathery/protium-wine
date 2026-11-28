@@ -1290,7 +1290,17 @@ static bool stream_decodebin_create(struct wg_parser_stream *stream)
     gst_bin_add(GST_BIN(parser->container), stream->decodebin);
 
     g_signal_connect(stream->decodebin, "pad-added", G_CALLBACK(stream_decodebin_pad_added_cb), stream);
+#ifdef __APPLE__
+    /* autoplug_select_cb takes the parser, and reads its "error" before it lets a decoder be tried.
+     * Given the stream, it read that out of the stream's second condition variable, at the byte
+     * where macOS keeps a part of the variable's signature, which is never 0: every decoder of
+     * every compressed stream was skipped ("Missing decoder: Windows Media Video 8", with FFmpeg's
+     * decoder for it there), and a game's video through DirectShow or the Windows Media reader
+     * never started. On Linux that byte is one of a condition variable nobody waits on, 0. */
+    g_signal_connect(stream->decodebin, "autoplug-select", G_CALLBACK(autoplug_select_cb), parser);
+#else
     g_signal_connect(stream->decodebin, "autoplug-select", G_CALLBACK(autoplug_select_cb), stream);
+#endif
     g_signal_connect(stream->decodebin, "no-more-pads", G_CALLBACK(stream_decodebin_no_more_pads_cb), stream);
 
     pthread_mutex_lock(&parser->mutex);
