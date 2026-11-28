@@ -2766,8 +2766,17 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT))
             FIXME( "Swapchain does not support required VK_IMAGE_USAGE_STORAGE_BIT\n" );
 
+#ifdef __APPLE__
+        /* Proton takes the host surface's minImageExtent for its size, which Linux's drivers give
+         * as the window's; Mesa's Metal WSI gives 1x1 there and the size in currentExtent, so the
+         * swapchain was 1x1 and every present came back VK_ERROR_OUT_OF_DATE_KHR (DOOM 2016) */
+        swapchain->host_extents = capabilities.currentExtent.width != 0xffffffff ? capabilities.currentExtent
+                                                                                 : capabilities.minImageExtent;
+        create_info_host.imageExtent = swapchain->host_extents;
+#else
         swapchain->host_extents = capabilities.minImageExtent;
         create_info_host.imageExtent = capabilities.minImageExtent;
+#endif
         create_info_host.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         create_info_host.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT;
 
